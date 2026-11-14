@@ -1,0 +1,42 @@
+# Providers compiled into Cradle. Validated by crates/cradle-backends/build.rs: an
+# invalid entry fails the build.
+#
+# Users can add or override entries (matched by `id`) in ~/.config/cradle/providers.toml.
+# Never put secrets here. `api_key_env` is the *name* of the env var / keychain entry.
+#
+# kind: anthropic | openai_compatible | claude_code | codex
+
+[[provider]]
+id = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+models = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+default_model = "claude-opus-5-5"
+
+[[provider]]
+id = "ollama"
+kind = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+auth = "none"
+
+# OpenAI itself: fill in the models you use.
+# [[provider]]
+# id = "openai"
+# kind = "openai_compatible"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+# models = []
+
+[[provider]]
+id = "claude-code"
+kind = "claude_code"
+binary = "claude"
+models = ["opus", "sonnet", "haiku", "fable"] # Claude Code's aliases for the latest of each
+version = ">=2.1, <3.0" # developed against 2.1.311
+
+[[provider]]
+id = "codex"
+kind = "codex"
+binary = "codex"
+# version: not set until the Codex CLI flags are verified

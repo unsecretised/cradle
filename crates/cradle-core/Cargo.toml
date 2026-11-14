@@ -1,0 +1,23 @@
+[package]
+name = "cradle-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cradle-backends.workspace = true
+cradle-config.workspace = true
+cradle-mcp.workspace = true
+cradle-tools.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+cradle-provider-spec.workspace = true
+tempfile.workspace = true

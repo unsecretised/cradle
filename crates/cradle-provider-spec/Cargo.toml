@@ -1,0 +1,12 @@
+[package]
+name = "cradle-provider-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Used as a build-dependency by cradle-backends, so keep dependencies light.
+[dependencies]
+semver.workspace = true
+serde.workspace = true
+toml.workspace = true
+url.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "cradle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+cradle-backends.workspace = true
+cradle-config.workspace = true
+cradle-core.workspace = true
+cradle-provider-spec.workspace = true
+cradle-tools.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+pulldown-cmark.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

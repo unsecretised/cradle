@@ -1,0 +1,16 @@
+[default]
+plan_mode = "modes/plan_mode.md"
+build_mode = "modes/build_mode.md"
+clash_handler = "ask" # override | combine | ask
+
+[extra]
+debug_mode = "modes/debug_mode.md"
+
+# The only commands an agent may run. BUILD.md explains them.
+[commands]
+build = "cargo build --workspace"
+run = "cargo run --"
+test = "cargo test --workspace"
+lint = "cargo clippy --workspace --all-targets -- -D warnings"
+fmt_check = "cargo fmt --all --check"
+fmt = "cargo fmt --all"
