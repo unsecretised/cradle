@@ -7,7 +7,8 @@ access, API keys or an installed CLI.
 
 - **cradle-config**: detecting `.agents/` vs `agents.toml` (and the clash); loading this
   repository's own `.agents/`; both forms; mode tables, `[extra]` forms, mode commands
-  and path resolution (escapes rejected); skills and front matter; `config.toml` round trip.
+  and path resolution (escapes rejected); skills and front matter; `config.toml` round trip;
+  `theme.toml` parsing (all value forms, per-entry warnings, invalid TOML, overlay).
 - **cradle-provider-spec**: validation errors (duplicate `id`, unknown `kind`, bad URL,
   `default_model` not in `models`, fields not allowed for a kind, `prompt_caching` on
   `openai_compatible`, values that look like secrets); runtime overlay merge by `id`.
@@ -23,10 +24,12 @@ access, API keys or an installed CLI.
 - **cradle-core**: trust snapshot hash stability, diff and store round trip; mode
   resolution and clashes; reviewer verdict parsing (missing or garbled means unsure);
   prompt assembly; session log write, list and resume; `ask_user` answer formatting.
-- **cradle** (bin): slash command suggestions, model picker, markdown rendering, text
-  wrapping, tool cards, and TUI behaviour driven by key events (Tab/Shift+Tab mode
-  cycling, input history, sidebar, approvals with requested changes, grouped tool calls,
-  multi-question stepping and dismissal).
+- **cradle** (bin): theme presets (complete and valid, the dark preset matches the
+  original colours and is the `--example` output, roles cascade, palette names resolve,
+  bad values keep the preset, optional background); slash command suggestions, model
+  picker, markdown rendering, text wrapping, tool cards, and TUI behaviour driven by key
+  events (Tab/Shift+Tab mode cycling, input history, sidebar, approvals with requested
+  changes, grouped tool calls, multi-question stepping and dismissal, `/theme reload`).
 
 ## Integration tests
 

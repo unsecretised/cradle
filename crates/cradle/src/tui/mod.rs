@@ -6,6 +6,7 @@ mod onboard;
 mod picker;
 mod questions;
 mod text;
+pub mod theme;
 mod tools;
 mod view;
 
@@ -39,6 +40,7 @@ use cradle_core::AgentSetup;
 use picker::{ModelPicker, PickerAction};
 use questions::Questions;
 use text::Input;
+use theme::Theme;
 
 /// Mouse button and wheel reports (SGR encoding), without motion tracking, which would
 /// redraw on every mouse move.
@@ -84,6 +86,8 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         user_config,
     } = session;
     let mut keys = EventStream::new();
+    let theme_path = cradle_config::paths::theme();
+    let (theme, theme_warnings) = theme::load(theme_path.as_deref());
 
     let backend = match backend {
         Ok(backend) => backend,
@@ -95,6 +99,7 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
                 reason,
                 preselect.as_deref(),
                 user_config.as_deref(),
+                &theme,
             )
             .await?;
             match chosen {
@@ -112,6 +117,9 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         trusted,
         providers,
         user_config,
+        theme,
+        theme_warnings,
+        theme_path,
     };
     let mut app = App::new(info, &setup);
     app.load_models();
@@ -126,6 +134,11 @@ struct StartInfo<'a> {
     trusted: bool,
     providers: Vec<ProviderSpec>,
     user_config: Option<std::path::PathBuf>,
+    theme: Theme,
+    /// Problems in `theme.toml`, shown as notices.
+    theme_warnings: Vec<String>,
+    /// `~/.config/cradle/theme.toml`, for `/theme`.
+    theme_path: Option<PathBuf>,
 }
 
 /// Results of work the UI started in the background.
@@ -264,6 +277,8 @@ pub(crate) struct App {
     pub suggest_index: usize,
     /// Esc hides suggestions until the input changes.
     suggest_hidden: bool,
+    pub theme: Theme,
+    theme_path: Option<PathBuf>,
 }
 
 impl App {
@@ -302,6 +317,7 @@ impl App {
                 info.resumed
             )));
         }
+        items.extend(theme_notices(&info.theme_warnings));
         App {
             items,
             scroll: 0,
@@ -341,6 +357,8 @@ impl App {
             models_error: None,
             suggest_index: 0,
             suggest_hidden: false,
+            theme: info.theme,
+            theme_path: info.theme_path,
         }
     }
 
@@ -822,6 +840,9 @@ impl App {
                 self.use_skill(skill, &request, handle);
             }
             ("sidebar", _) => self.sidebar = !self.sidebar,
+            ("theme", None) => self.describe_theme(),
+            ("theme", Some("reload")) => self.reload_theme(),
+            ("theme", _) => self.note("Usage: /theme | /theme reload"),
             ("clear", _) => {
                 self.items.clear();
                 self.usage = Usage::default();
@@ -829,6 +850,40 @@ impl App {
             }
             _ => self.note(&format!("Unknown command /{name}. Try /help.")),
         }
+    }
+
+    /// `/theme`: where the theme comes from.
+    fn describe_theme(&mut self) {
+        let preset = self.theme.preset;
+        let text = match &self.theme_path {
+            None => format!("Theme: {preset} preset. No config directory, so no theme.toml."),
+            Some(path) if path.is_file() => format!(
+                "Theme: {} on the {preset} preset. Edit it, then /theme reload.",
+                path.display()
+            ),
+            Some(path) => format!(
+                "Theme: {preset} preset. To customise it: cradle theme --example > {}",
+                path.display()
+            ),
+        };
+        self.note(&text);
+    }
+
+    /// `/theme reload`: read `theme.toml` again and report any problems.
+    fn reload_theme(&mut self) {
+        let (theme, warnings) = theme::load(self.theme_path.as_deref());
+        self.theme = theme;
+        let summary = if warnings.is_empty() {
+            format!("Theme reloaded ({} preset).", self.theme.preset)
+        } else {
+            format!(
+                "Theme reloaded ({} preset) with {} problem(s); the rest applied.",
+                self.theme.preset,
+                warnings.len()
+            )
+        };
+        self.note(&summary);
+        self.items.extend(theme_notices(&warnings));
     }
 
     fn on_ui(&mut self, event: UiEvent) {
@@ -992,6 +1047,13 @@ fn send(handle: &AgentHandle, command: AgentCommand) {
     let _ = handle.commands.send(command);
 }
 
+/// Problems in `theme.toml`, as conversation notices.
+fn theme_notices(warnings: &[String]) -> impl Iterator<Item = Item> + '_ {
+    warnings
+        .iter()
+        .map(|w| Item::Notice(format!("theme.toml: {w}")))
+}
+
 /// A provider's configured models; CLI providers also offer their own `default`.
 fn configured_models(spec: &ProviderSpec) -> impl Iterator<Item = String> + '_ {
     let (default, models) = match &spec.backend {
@@ -1094,6 +1156,10 @@ mod tests {
 
     /// An app wired to a real agent (the model is never called in these tests).
     fn start(dir: &std::path::Path) -> (App, AgentHandle) {
+        start_with_theme(dir, None)
+    }
+
+    fn start_with_theme(dir: &std::path::Path, theme_path: Option<PathBuf>) -> (App, AgentHandle) {
         let setup = AgentSetup {
             backend: Backend::new(&spec(), Some("small")).unwrap(),
             guard: cradle_tools::PathGuard::new(dir).unwrap(),
@@ -1114,9 +1180,65 @@ mod tests {
             trusted: false,
             providers: vec![spec()],
             user_config: None,
+            theme: Theme::default(),
+            theme_warnings: Vec::new(),
+            theme_path,
         };
         let app = App::new(info, &setup);
         (app, cradle_core::spawn(setup))
+    }
+
+    #[tokio::test]
+    async fn theme_reload_applies_and_reports_problems() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("theme.toml");
+        let (mut app, handle) = start_with_theme(dir.path(), Some(path.clone()));
+        let notices = |app: &App| -> Vec<String> {
+            app.items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Notice(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        type_text(&mut app, &handle, "/theme");
+        press(&mut app, &handle, KeyCode::Enter);
+        assert!(
+            notices(&app)
+                .last()
+                .unwrap()
+                .contains("cradle theme --example"),
+            "no file yet: {:?}",
+            notices(&app)
+        );
+
+        std::fs::write(
+            &path,
+            "preset = \"light\"\n[ui]\nborder = \"red\"\ncursor = \"nope\"\n",
+        )
+        .unwrap();
+        type_text(&mut app, &handle, "/theme reload");
+        press(&mut app, &handle, KeyCode::Enter);
+        assert_eq!(app.theme.preset, "light");
+        assert_eq!(
+            app.theme.border,
+            ratatui::style::Style::new().fg(ratatui::style::Color::Red)
+        );
+        let n = notices(&app);
+        assert!(n.iter().any(|n| n.contains("1 problem")), "{n:?}");
+        assert!(
+            n.iter()
+                .any(|n| n.starts_with("theme.toml: ui.cursor: unknown colour `nope`")),
+            "{n:?}"
+        );
+        // The bad element keeps the light preset's style.
+        assert_eq!(
+            app.theme.cursor,
+            ratatui::style::Style::new().fg(ratatui::style::Color::Blue)
+        );
+        assert!(screen(&app).contains("Theme reloaded"));
     }
 
     fn screen(app: &App) -> String {

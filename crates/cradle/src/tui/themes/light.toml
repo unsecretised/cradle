@@ -1,0 +1,14 @@
+# Built-in "light" preset, applied on top of the dark one. 256-colour indexes are used
+# instead of hex so it works without true-colour support.
+
+[roles]
+accent = "blue"
+success = "green"
+warning = 136     # dark gold: yellow is unreadable on white
+error = "red"
+muted = 244       # mid gray
+on_accent = "white"
+
+[markdown]
+code = "blue"
+"code.block" = "blue"

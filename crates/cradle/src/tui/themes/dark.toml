@@ -1,0 +1,96 @@
+# Cradle theme: ~/.config/cradle/theme.toml (global; projects cannot set it)
+#
+# This is the built-in "dark" theme, printed by `cradle theme --example`. Save it as
+# ~/.config/cradle/theme.toml and change what you like: anything you leave out keeps the
+# preset's value. `/theme reload` applies changes without restarting, and `cradle theme`
+# checks the file.
+#
+# Colours: names (black, red, green, yellow, blue, magenta, cyan, gray, darkgray,
+# lightred, lightgreen, lightyellow, lightblue, lightmagenta, lightcyan, white, reset),
+# hex ("#61afef", needs a true-colour terminal) or 256-colour indexes (244 or "244").
+# A name is looked up in [palette] first, then [roles], then as a colour.
+#
+# A style is a colour (the foreground) or { fg = ..., bg = ..., modifiers = [...] }.
+# Modifiers: bold, dim, italic, underlined, reversed, crossed_out.
+# Setting an element replaces the preset's whole style for it.
+
+# Start from "dark" (this file) or "light"; the rest of the file is applied on top.
+# preset = "dark"
+
+[palette]
+# Your own colour names, for use below. For example:
+# blue = "#61afef"
+
+[roles]
+# Most elements use a role, so changing a role recolours all of them.
+accent = "cyan"       # borders, selection, cursor, links, list markers, read-only modes
+success = "green"     # full-access modes, finished tools, added lines
+warning = "yellow"    # running tools, approvals, notes
+error = "red"         # failures, removed lines
+muted = "darkgray"    # hints, notices, secondary text
+on_accent = "black"   # text on an accent or success background
+
+[ui]
+# Whole-screen style. Unset: the terminal's own colours.
+# background = { fg = "white", bg = "#1e1e2e" }
+brand = { modifiers = ["reversed", "bold"] }   # " cradle " in the header
+"mode.read_only" = { fg = "on_accent", bg = "accent", modifiers = ["bold"] }
+"mode.full" = { fg = "on_accent", bg = "success", modifiers = ["bold"] }
+"input.read_only" = "accent"   # input box border in a read-only mode
+"input.full" = "success"       # input box border in a full-access mode
+border = "accent"              # popups and the setup screen
+"border.approval" = "warning"
+"border.help" = {}
+selection = { fg = "on_accent", bg = "accent" }
+cursor = "accent"
+hint = "muted"                 # key hints, labels, secondary text
+title = { modifiers = ["bold"] }
+note = "warning"               # notes in dialogs and pickers
+confirm = { fg = "warning", modifiers = ["bold"] }   # "dismiss all?" prompts
+prompt = { fg = "accent", modifiers = ["bold"] }     # "What should the agent do instead?"
+"user.mark" = { fg = "accent", modifiers = ["bold"] }  # the › before your messages
+user = { modifiers = ["bold"] }
+notice = "muted"
+"error.mark" = { fg = "error", modifiers = ["bold"] }
+error = "error"
+thinking = { fg = "muted", modifiers = ["italic"] }
+
+[tool]
+running = "warning"
+ok = "success"
+failed = "error"
+detail = "muted"               # previews and expanded file lists
+
+[diff]
+added = "success"
+removed = "error"
+hunk = "accent"
+header = { fg = "muted", modifiers = ["bold"] }   # file names and diff titles
+
+[review]
+safe = "success"
+unsafe = "error"
+unsure = "warning"
+
+[markdown]
+h1 = { fg = "magenta", modifiers = ["bold", "underlined"] }
+h2 = { fg = "magenta", modifiers = ["bold"] }
+heading = { modifiers = ["bold"] }   # h3 and below
+code = "yellow"                      # `inline code`
+"code.block" = "yellow"
+link = { fg = "accent", modifiers = ["underlined"] }
+image = "accent"
+"list.marker" = "accent"
+quote = { modifiers = ["italic"] }
+"table.header" = { modifiers = ["bold"] }
+punctuation = "muted"   # code frames, quote bars, rules, table borders, link URLs
+
+[setup]
+selected = { modifiers = ["bold", "reversed"] }
+provider = { modifiers = ["bold"] }
+id = "muted"
+ready = "success"
+needs_key = "warning"
+missing = "muted"
+ok = "success"
+error = "error"

@@ -3,12 +3,13 @@
 use cradle_core::{ReviewPolicy, Verdict};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use super::commands::{COMMANDS, Suggestion};
 use super::text::wrap;
+use super::theme::Theme;
 use super::tools::ToolGroup;
 use super::{App, Item, Modal, ToolState};
 
@@ -22,6 +23,10 @@ const SIDEBAR_MIN_TERMINAL: u16 = 90;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let theme = &app.theme;
+    if let Some(background) = theme.background {
+        frame.render_widget(Block::new().style(background), area);
+    }
     let show_sidebar = app.sidebar && area.width >= SIDEBAR_MIN_TERMINAL;
     let [header, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
     let (main, sidebar) = if show_sidebar {
@@ -52,17 +57,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(
             " Enter send · Shift+Enter newline · / commands · Tab mode · Esc cancel · wheel/PgUp scroll · Ctrl+O tools",
         )
-        .style(dim()),
+        .style(theme.hint),
         footer,
     );
 
     if let Some(modal) = &app.modal {
-        draw_modal(frame, area, modal);
+        draw_modal(frame, area, modal, theme);
     } else {
         let suggestions = app.suggestions();
         if !suggestions.is_empty() {
-            draw_suggestions(frame, body, input, &suggestions, app.suggest_index);
+            draw_suggestions(frame, body, input, &suggestions, app.suggest_index, theme);
         }
+    }
+}
+
+/// Blank out `rect` for a popup, keeping the theme's background if it has one.
+fn clear(frame: &mut Frame, rect: Rect, theme: &Theme) {
+    frame.render_widget(Clear, rect);
+    if let Some(background) = theme.background {
+        frame.render_widget(Block::new().style(background), rect);
     }
 }
 
@@ -75,6 +88,7 @@ fn draw_suggestions(
     input: Rect,
     suggestions: &[Suggestion],
     selected: usize,
+    theme: &Theme,
 ) {
     let selected = selected.min(suggestions.len() - 1);
     let rows = suggestions.len().min(MAX_SUGGESTIONS);
@@ -102,10 +116,10 @@ fn draw_suggestions(
         .take(rows)
         .map(|(i, s)| {
             let (label_style, detail_style) = if i == selected {
-                let on = Style::new().fg(Color::Black).bg(Color::Cyan);
+                let on = theme.selection;
                 (on.add_modifier(Modifier::BOLD), on)
             } else {
-                (Style::new().add_modifier(Modifier::BOLD), dim())
+                (theme.title, theme.hint)
             };
             let pad = label_width.saturating_sub(super::text::display_width(&s.label));
             Line::from(vec![
@@ -121,26 +135,27 @@ fn draw_suggestions(
         " ↑↓ select · Tab complete · Enter run · Esc hide ".to_owned()
     };
     let block = Block::bordered()
-        .title_bottom(Line::styled(hint, dim()))
-        .border_style(Style::new().fg(Color::Cyan));
-    frame.render_widget(Clear, rect);
+        .title_bottom(Line::styled(hint, theme.hint))
+        .border_style(theme.border);
+    clear(frame, rect, theme);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// Files changed this session and token usage.
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let block = Block::new()
         .borders(ratatui::widgets::Borders::LEFT)
-        .border_style(dim())
+        .border_style(theme.hint)
         .padding(ratatui::widgets::Padding::horizontal(1));
     let width = block.inner(area).width as usize;
-    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let bold = theme.title;
     let mut lines = vec![Line::styled(
         format!("Changed files ({})", app.files.len()),
         bold,
     )];
     if app.files.is_empty() {
-        lines.push(Line::styled("none yet", dim()));
+        lines.push(Line::styled("none yet", theme.hint));
     }
     let (mut added, mut removed) = (0, 0);
     for file in &app.files {
@@ -151,15 +166,15 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         let pad = width.saturating_sub(super::text::display_width(&path) + counts.len());
         lines.push(Line::from(vec![
             Span::raw(format!("{path}{}", " ".repeat(pad))),
-            Span::styled(format!(" +{}", file.added), Style::new().fg(Color::Green)),
-            Span::styled(format!(" -{}", file.removed), Style::new().fg(Color::Red)),
+            Span::styled(format!(" +{}", file.added), theme.diff_added),
+            Span::styled(format!(" -{}", file.removed), theme.diff_removed),
         ]));
     }
     if app.files.len() > 1 {
         lines.push(Line::from(vec![
-            Span::styled("total ", dim()),
-            Span::styled(format!("+{added}"), Style::new().fg(Color::Green)),
-            Span::styled(format!(" -{removed}"), Style::new().fg(Color::Red)),
+            Span::styled("total ", theme.hint),
+            Span::styled(format!("+{added}"), theme.diff_added),
+            Span::styled(format!(" -{removed}"), theme.diff_removed),
         ]));
     }
 
@@ -175,7 +190,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         let value = tokens(value);
         let pad = width.saturating_sub(label.len() + value.len());
         lines.push(Line::from(vec![
-            Span::styled(format!("{label}{}", " ".repeat(pad)), dim()),
+            Span::styled(format!("{label}{}", " ".repeat(pad)), theme.hint),
             Span::raw(value),
         ]));
     }
@@ -224,10 +239,11 @@ fn ago(secs: u64) -> String {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, show_tokens: bool) {
+    let theme = &app.theme;
     let mode_style = if app.read_only {
-        Style::new().fg(Color::Black).bg(Color::Cyan)
+        theme.mode_read_only
     } else {
-        Style::new().fg(Color::Black).bg(Color::Green)
+        theme.mode_full
     };
     let mode = format!(
         " {}{} ",
@@ -240,13 +256,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, show_tokens: bool) {
     };
     let u = &app.usage;
     let mut spans = vec![
-        Span::styled(
-            " cradle ",
-            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-        ),
+        Span::styled(" cradle ", theme.brand),
         Span::raw(format!(" {}/{} ", app.provider, app.model)),
-        Span::styled(mode, mode_style.add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {review}"), dim()),
+        Span::styled(mode, mode_style),
+        Span::styled(format!("  {review}"), theme.hint),
     ];
     if show_tokens {
         spans.push(Span::styled(
@@ -254,7 +267,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, show_tokens: bool) {
                 "  tokens in {} out {} cached {}",
                 u.input_tokens, u.output_tokens, u.cache_read_tokens
             ),
-            dim(),
+            theme.hint,
         ));
     }
     let line = Line::from(spans);
@@ -265,7 +278,14 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let width = (area.width as usize).saturating_sub(2).max(10);
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.items {
-        render_item(item, width, app.spinner, app.tools_expanded, &mut lines);
+        render_item(
+            item,
+            width,
+            app.spinner,
+            app.tools_expanded,
+            &app.theme,
+            &mut lines,
+        );
         lines.push(Line::raw(""));
     }
     // While busy, the input box's title shows the spinner and how to cancel.
@@ -288,13 +308,14 @@ fn render_tools(
     width: usize,
     spinner: usize,
     expanded: bool,
+    theme: &Theme,
     out: &mut Vec<Line<'static>>,
 ) {
     let state = group.state();
-    let (mark, color) = match state {
-        ToolState::Running => (SPINNER[spinner % SPINNER.len()], Color::Yellow),
-        ToolState::Ok => ("✓", Color::Green),
-        ToolState::Failed => ("✗", Color::Red),
+    let (mark, mark_style) = match state {
+        ToolState::Running => (SPINNER[spinner % SPINNER.len()], theme.tool_running),
+        ToolState::Ok => ("✓", theme.tool_ok),
+        ToolState::Failed => ("✗", theme.tool_failed),
     };
     let single = group.is_single();
     let mut title = group.title();
@@ -305,20 +326,21 @@ fn render_tools(
     gutter(
         out,
         &format!("{mark} "),
-        Style::new().fg(color),
+        mark_style,
         &title,
         Style::new(),
         width,
     );
 
     let inner = width.saturating_sub(2);
-    let red = Style::new().fg(Color::Red);
+    let red = theme.tool_failed;
+    let dim = theme.tool_detail;
     if single {
         let entry = &group.calls[0];
         let failed = entry.state == ToolState::Failed;
         if !entry.preview.is_empty() && (failed || !entry.groups()) {
-            let style = if failed { red } else { dim() };
-            gutter(out, "  │ ", dim(), &entry.preview, style, inner);
+            let style = if failed { red } else { dim };
+            gutter(out, "  │ ", dim, &entry.preview, style, inner);
         }
         return;
     }
@@ -341,11 +363,11 @@ fn render_tools(
                 None if entry.state == ToolState::Failed => {
                     gutter(out, "  │ ✗ ", red, detail, red, inner)
                 }
-                None => gutter(out, "  │ ", dim(), detail, dim(), inner),
+                None => gutter(out, "  │ ", dim, detail, dim, inner),
             }
         }
         if entry.state == ToolState::Failed && !entry.preview.is_empty() {
-            gutter(out, "  │   ", dim(), &entry.preview, red, inner);
+            gutter(out, "  │   ", dim, &entry.preview, red, inner);
         }
     }
 }
@@ -355,22 +377,16 @@ fn render_item(
     width: usize,
     spinner: usize,
     expanded: bool,
+    theme: &Theme,
     out: &mut Vec<Line<'static>>,
 ) {
     match item {
-        Item::User(text) => gutter(
-            out,
-            "› ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            text,
-            Style::new().add_modifier(Modifier::BOLD),
-            width,
-        ),
-        Item::Assistant(text) => render_markdown(text, width, out),
+        Item::User(text) => gutter(out, "› ", theme.user_mark, text, theme.user, width),
+        Item::Assistant(text) => render_markdown(text, width, theme, out),
         Item::Thinking(text) => {
             let wrapped = wrap(text.trim(), width);
             let skip = wrapped.len().saturating_sub(MAX_THINKING_LINES);
-            let style = dim().add_modifier(Modifier::ITALIC);
+            let style = theme.thinking;
             if skip > 0 {
                 out.push(Line::styled(
                     format!("✻ … {skip} earlier lines of thinking"),
@@ -382,16 +398,13 @@ fn render_item(
                 out.push(Line::styled(format!("{mark}{line}"), style));
             }
         }
-        Item::Tools(group) => render_tools(group, width, spinner, expanded, out),
+        Item::Tools(group) => render_tools(group, width, spinner, expanded, theme, out),
         Item::Diff { title, diff } => {
-            out.push(Line::styled(
-                format!("  {title}"),
-                dim().add_modifier(Modifier::BOLD),
-            ));
+            out.push(Line::styled(format!("  {title}"), theme.diff_header));
             let lines: Vec<&str> = diff.lines().collect();
             for line in lines.iter().take(MAX_DIFF_LINES) {
                 for part in wrap(line, width.saturating_sub(2)) {
-                    out.push(Line::styled(format!("  {part}"), diff_style(line)));
+                    out.push(Line::styled(format!("  {part}"), diff_style(line, theme)));
                 }
             }
             if lines.len() > MAX_DIFF_LINES {
@@ -400,7 +413,7 @@ fn render_item(
                         "  … {} more lines (/diff shows all changes)",
                         lines.len() - MAX_DIFF_LINES
                     ),
-                    dim(),
+                    theme.hint,
                 ));
             }
         }
@@ -409,35 +422,28 @@ fn render_item(
             verdict,
             reason,
         } => {
-            let (word, color) = match verdict {
-                Verdict::Safe => ("safe, running", Color::Green),
-                Verdict::Unsafe => ("unsafe, asking you", Color::Red),
-                Verdict::Unsure => ("unsure, asking you", Color::Yellow),
+            let (word, style) = match verdict {
+                Verdict::Safe => ("safe, running", theme.review_safe),
+                Verdict::Unsafe => ("unsafe, asking you", theme.review_unsafe),
+                Verdict::Unsure => ("unsure, asking you", theme.review_unsure),
             };
             gutter(
                 out,
                 "◆ ",
-                Style::new().fg(color),
+                style,
                 &format!("reviewer: `{command}` is {word}. {reason}"),
-                Style::new().fg(color),
+                style,
                 width,
             );
         }
-        Item::Notice(text) => gutter(out, "· ", dim(), text, dim(), width),
-        Item::Error(text) => gutter(
-            out,
-            "! ",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-            text,
-            Style::new().fg(Color::Red),
-            width,
-        ),
+        Item::Notice(text) => gutter(out, "· ", theme.notice, text, theme.notice, width),
+        Item::Error(text) => gutter(out, "! ", theme.error_mark, text, theme.error, width),
     }
 }
 
 /// Model output, rendered as markdown with a two-column margin.
-fn render_markdown(text: &str, width: usize, out: &mut Vec<Line<'static>>) {
-    for line in super::markdown::render(text, width) {
+fn render_markdown(text: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {
+    for line in super::markdown::render(text, width, theme) {
         let mut spans = vec![Span::raw("  ")];
         spans.extend(line.spans);
         out.push(Line::from(spans));
@@ -477,13 +483,11 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, lines: &[String], cursor
         format!(" {} › ", app.mode)
     };
     let border = if app.read_only {
-        Color::Cyan
+        app.theme.input_read_only
     } else {
-        Color::Green
+        app.theme.input_full
     };
-    let block = Block::bordered()
-        .title(title)
-        .border_style(Style::new().fg(border));
+    let block = Block::bordered().title(title).border_style(border);
     let inner = block.inner(area);
     let visible = inner.height as usize;
     let first = (cursor.0 + 1).saturating_sub(visible);
@@ -502,7 +506,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, lines: &[String], cursor
     }
 }
 
-fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
+fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
     // Never larger than the terminal, however small it is.
     let width = area.width.saturating_sub(4).min(110);
     let height = area.height.saturating_sub(4);
@@ -512,7 +516,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
         width,
         height,
     };
-    frame.render_widget(Clear, rect);
+    clear(frame, rect, theme);
     let inner_width = width.saturating_sub(4) as usize;
 
     match modal {
@@ -528,13 +532,13 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             let mut lines: Vec<Line> = Vec::new();
             if let Some(note) = note {
                 for l in wrap(note, inner_width) {
-                    lines.push(Line::styled(l, Style::new().fg(Color::Yellow)));
+                    lines.push(Line::styled(l, theme.note));
                 }
                 lines.push(Line::raw(""));
             }
             for raw in body.lines() {
                 for l in wrap(raw, inner_width) {
-                    lines.push(Line::styled(l, diff_style(raw)));
+                    lines.push(Line::styled(l, diff_style(raw, theme)));
                 }
             }
             let keys = match (feedback, always) {
@@ -548,11 +552,8 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             };
             let block = Block::bordered()
                 .title(format!(" {title} "))
-                .title_bottom(Line::styled(
-                    keys,
-                    Style::new().add_modifier(Modifier::BOLD),
-                ))
-                .border_style(Style::new().fg(Color::Yellow))
+                .title_bottom(Line::styled(keys, theme.title))
+                .border_style(theme.border_approval)
                 .padding(ratatui::widgets::Padding::horizontal(1));
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
@@ -562,17 +563,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                 Some(input) => {
                     let mut out = vec![Line::styled(
                         "What should the agent do instead?",
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        theme.prompt,
                     )];
                     let (text, _) = input.layout(inner.width.saturating_sub(2) as usize);
                     let last = text.len() - 1;
                     for (i, l) in text.into_iter().enumerate() {
-                        let mut spans = vec![
-                            Span::styled("› ", Style::new().fg(Color::Cyan)),
-                            Span::raw(l),
-                        ];
+                        let mut spans = vec![Span::styled("› ", theme.cursor), Span::raw(l)];
                         if i == last {
-                            spans.push(Span::styled("▏", Style::new().fg(Color::Cyan)));
+                            spans.push(Span::styled("▏", theme.cursor));
                         }
                         out.push(Line::from(spans));
                     }
@@ -604,10 +602,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             let block = Block::bordered()
                 .title(questions.title())
                 .title_bottom(questions.hint())
-                .border_style(Style::new().fg(Color::Cyan))
+                .border_style(theme.border)
                 .padding(ratatui::widgets::Padding::horizontal(1));
             frame.render_widget(
-                Paragraph::new(questions.lines(inner_width, rows)).block(block),
+                Paragraph::new(questions.lines(inner_width, rows, theme)).block(block),
                 rect,
             );
         }
@@ -616,10 +614,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             let block = Block::bordered()
                 .title(" Choose a model ")
                 .title_bottom(" type to filter · ↑↓ choose · Enter switch · Esc cancel ")
-                .border_style(Style::new().fg(Color::Cyan))
+                .border_style(theme.border)
                 .padding(ratatui::widgets::Padding::horizontal(1));
             frame.render_widget(
-                Paragraph::new(picker.lines(inner_width, rows)).block(block),
+                Paragraph::new(picker.lines(inner_width, rows, theme)).block(block),
                 rect,
             );
         }
@@ -638,12 +636,12 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                         .next()
                         .unwrap_or_default();
                     let style = if i == *selected {
-                        Style::new().fg(Color::Black).bg(Color::Cyan)
+                        theme.selection
                     } else {
                         Style::new()
                     };
                     Line::from(vec![
-                        Span::styled(meta, if i == *selected { style } else { dim() }),
+                        Span::styled(meta, if i == *selected { style } else { theme.hint }),
                         Span::styled(title, style),
                     ])
                 })
@@ -651,7 +649,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             let block = Block::bordered()
                 .title(" Resume a conversation ")
                 .title_bottom(" ↑↓ choose · Enter resume · Esc cancel ")
-                .border_style(Style::new().fg(Color::Cyan))
+                .border_style(theme.border)
                 .padding(ratatui::widgets::Padding::horizontal(1));
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
@@ -687,10 +685,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                 .iter()
                 .map(|(k, v)| {
                     Line::from(vec![
-                        Span::styled(
-                            format!("{k:<24}"),
-                            Style::new().add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(format!("{k:<24}"), theme.title),
                         Span::raw(*v),
                     ])
                 })
@@ -698,26 +693,23 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             let block = Block::bordered()
                 .title(" Help ")
                 .title_bottom(" Esc to close ")
+                .border_style(theme.border_help)
                 .padding(ratatui::widgets::Padding::horizontal(1));
             frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
     }
 }
 
-fn diff_style(line: &str) -> Style {
+fn diff_style(line: &str, theme: &Theme) -> Style {
     if line.starts_with("+++") || line.starts_with("---") {
-        dim().add_modifier(Modifier::BOLD)
+        theme.diff_header
     } else if line.starts_with('+') {
-        Style::new().fg(Color::Green)
+        theme.diff_added
     } else if line.starts_with('-') {
-        Style::new().fg(Color::Red)
+        theme.diff_removed
     } else if line.starts_with("@@") {
-        Style::new().fg(Color::Cyan)
+        theme.diff_hunk
     } else {
         Style::new()
     }
-}
-
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
 }

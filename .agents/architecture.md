@@ -31,16 +31,17 @@ cradle-backends (build.rs) ─► cradle-provider-spec   [build-dependency]
 
 ## Main modules
 
-- **cradle** (bin): `main.rs` (clap: run, `providers`, `config`), `setup.rs` (trust and
-  clash prompts on stdin, session, backend choice), `inspect.rs`, `tui/` (`mod.rs` app
-  state, `view.rs`, `commands.rs` slash commands, `onboard.rs` setup screen, `picker.rs`
-  model picker, `markdown.rs`, `tools.rs` tool cards, `text.rs` input).
+- **cradle** (bin): `main.rs` (clap: run, `providers`, `config`, `theme`), `setup.rs`
+  (trust and clash prompts on stdin, session, backend choice), `inspect.rs`, `tui/`
+  (`mod.rs` app state, `view.rs`, `commands.rs` slash commands, `onboard.rs` setup screen,
+  `picker.rs` model picker, `markdown.rs`, `tools.rs` tool cards, `text.rs` input,
+  `theme.rs` + `themes/` colour presets).
 - **cradle-core**: `agent.rs` (the loop, run on its own task, talking to the UI over
   channels; enforces mode access, approvals and trust), `modes.rs` (`ModeSet`: built-in, global
   and project modes), `prompt.rs`, `review.rs` (reviewer subagent), `session.rs`, `trust.rs`.
   Built-in mode prompts are in `modes/` and `prompts/`.
 - **cradle-config**: `directory.rs` and `agents_toml.rs` (the two forms), `modes.rs`,
-  `skills.rs`, `user.rs` (`config.toml`), `paths.rs`.
+  `skills.rs`, `user.rs` (`config.toml`), `theme.rs` (`theme.toml`), `paths.rs`.
 - **cradle-tools**: `guard.rs` (`PathGuard`), `fs.rs`, `command.rs`, `specs.rs` (tool
   definitions and call parsing), `hygiene.rs`.
 - **cradle-backends**: `anthropic.rs`, `openai.rs`, `cli/` (Claude Code, Codex),
@@ -68,6 +69,7 @@ cradle-backends (build.rs) ─► cradle-provider-spec   [build-dependency]
 | What | Where |
 |---|---|
 | Default provider and model | `~/.config/cradle/config.toml` |
+| TUI theme | `~/.config/cradle/theme.toml` |
 | Global modes | `~/.config/cradle/modes/<name>.md` |
 | Runtime providers overlay | `~/.config/cradle/providers.toml` |
 | Trust hashes, source and clash choices | `~/.config/cradle/trust.toml` |

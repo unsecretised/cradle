@@ -17,6 +17,7 @@ Implemented features, with details in `features/`.
 | [CLI_BACKENDS](features/FEATURE_CLI_BACKENDS.md) | Claude Code + Codex with built-in tools off, Cradle's tools over a local MCP server |
 | [SESSIONS](features/FEATURE_SESSIONS.md) | JSONL transcripts, `--continue`, `/session` |
 | [TUI](features/FEATURE_TUI.md) | ratatui interface: setup screen, approvals, diffs, sidebar, slash commands |
+| [THEME](features/FEATURE_THEME.md) | Global `theme.toml`: dark/light presets, palette, roles, per-element styles, `/theme reload` |
 
 ## Roadmap
 

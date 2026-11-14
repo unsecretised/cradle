@@ -2,10 +2,11 @@
 //! anything typed can also be used as a model name as-is.
 
 use crossterm::event::KeyCode;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::text::{Input, wrap};
+use super::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
@@ -107,13 +108,13 @@ impl ModelPicker {
     }
 
     /// The rows to show: `rows` limits the list's height (it scrolls to the selection).
-    pub fn lines(&self, width: usize, rows: usize) -> Vec<Line<'static>> {
-        let dim = Style::new().fg(Color::DarkGray);
+    pub fn lines(&self, width: usize, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let dim = theme.hint;
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled("Filter or type a model: ", dim),
             Span::raw(self.input.text().to_owned()),
-            Span::styled("▏", Style::new().fg(Color::Cyan)),
+            Span::styled("▏", theme.cursor),
         ]));
         lines.push(Line::raw(""));
         if self.loading {
@@ -143,7 +144,7 @@ impl ModelPicker {
             };
             let mark = if is_current { " (current)" } else { "" };
             let style = if i == self.selected {
-                Style::new().fg(Color::Black).bg(Color::Cyan)
+                theme.selection
             } else if matches!(entry, Entry::Custom(_)) {
                 Style::new().add_modifier(Modifier::ITALIC)
             } else {
@@ -158,7 +159,7 @@ impl ModelPicker {
         if let Some(note) = &self.note {
             lines.push(Line::raw(""));
             for l in wrap(note, width) {
-                lines.push(Line::styled(l, Style::new().fg(Color::Yellow)));
+                lines.push(Line::styled(l, theme.note));
             }
         }
         lines

@@ -10,6 +10,7 @@ mod error;
 mod modes;
 pub mod paths;
 mod skills;
+pub mod theme;
 pub mod user;
 
 use std::collections::BTreeMap;

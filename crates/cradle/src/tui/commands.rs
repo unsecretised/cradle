@@ -79,6 +79,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         needs_arg: false,
     },
     CommandInfo {
+        name: "theme",
+        args: "[reload]",
+        description: "show the theme, or reload ~/.config/cradle/theme.toml",
+        needs_arg: false,
+    },
+    CommandInfo {
         name: "quit",
         args: "",
         description: "exit cradle",
@@ -207,6 +213,10 @@ fn suggest_args(command: &str, prefix: &str, ctx: &Context<'_>) -> Vec<Suggestio
                 "a reviewer approves safe commands; anything else goes to you".to_owned(),
             ),
         ],
+        "theme" => vec![(
+            "reload".to_owned(),
+            "read ~/.config/cradle/theme.toml again".to_owned(),
+        )],
         _ => Vec::new(),
     };
     let prefix = prefix.to_lowercase();

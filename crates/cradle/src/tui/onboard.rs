@@ -13,12 +13,13 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use super::picker::{ModelPicker, PickerAction};
 use super::text::{Input, wrap};
+use super::theme::Theme;
 use crate::Error;
 
 enum Status {
@@ -41,6 +42,7 @@ enum Step {
 
 struct Screen<'a> {
     providers: &'a [ProviderSpec],
+    theme: &'a Theme,
     rows: Vec<Row>,
     reason: String,
     selected: usize,
@@ -58,6 +60,7 @@ pub async fn run(
     reason: String,
     preselect: Option<&str>,
     user_config: Option<&Path>,
+    theme: &Theme,
 ) -> Result<Option<Backend>, Error> {
     let rows = providers.iter().map(row).collect();
     let selected = preselect
@@ -65,6 +68,7 @@ pub async fn run(
         .unwrap_or(0);
     let mut screen = Screen {
         providers,
+        theme,
         rows,
         reason,
         selected,
@@ -242,7 +246,11 @@ impl Screen<'_> {
     }
 
     fn draw(&self, frame: &mut Frame) {
+        let theme = self.theme;
         let area = frame.area();
+        if let Some(background) = theme.background {
+            frame.render_widget(Block::new().style(background), area);
+        }
         let width = area.width.saturating_sub(4).min(96);
         let rect = Rect {
             x: area.x + area.width.saturating_sub(width) / 2,
@@ -265,7 +273,7 @@ impl Screen<'_> {
                 let style = if self.reason.is_empty() {
                     Style::new()
                 } else {
-                    Style::new().fg(Color::Yellow)
+                    theme.note
                 };
                 for l in wrap(&intro, inner) {
                     lines.push(Line::styled(l, style));
@@ -274,27 +282,27 @@ impl Screen<'_> {
                 for (i, row) in self.rows.iter().enumerate() {
                     let marker = if i == self.selected { "▸ " } else { "  " };
                     let title_style = if i == self.selected {
-                        Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                        theme.setup_selected
                     } else {
-                        Style::new().add_modifier(Modifier::BOLD)
+                        theme.setup_provider
                     };
-                    let (status, color) = match &row.status {
-                        Status::Ready(s) => (s.clone(), Color::Green),
+                    let (status, status_style) = match &row.status {
+                        Status::Ready(s) => (s.clone(), theme.setup_ready),
                         Status::NeedsKey(env) => {
-                            (format!("needs an API key (${env})"), Color::Yellow)
+                            (format!("needs an API key (${env})"), theme.setup_needs_key)
                         }
-                        Status::CliInstalled(v) => (format!("installed ({v})"), Color::Green),
-                        Status::CliMissing => ("not installed".into(), Color::DarkGray),
+                        Status::CliInstalled(v) => (format!("installed ({v})"), theme.setup_ready),
+                        Status::CliMissing => ("not installed".into(), theme.setup_missing),
                     };
                     lines.push(Line::from(vec![
                         Span::raw(marker),
                         Span::styled(format!(" {} ", row.title), title_style),
                         Span::raw("  "),
-                        Span::styled(status, Style::new().fg(color)),
+                        Span::styled(status, status_style),
                     ]));
                     lines.push(Line::styled(
                         format!("    {}", self.providers[i].id),
-                        Style::new().fg(Color::DarkGray),
+                        theme.setup_id,
                     ));
                 }
             }
@@ -317,27 +325,31 @@ impl Screen<'_> {
                 lines.push(Line::raw(""));
                 let masked: String = "•".repeat(input.text().chars().count());
                 lines.push(Line::from(vec![
-                    Span::styled("Key: ", Style::new().fg(Color::DarkGray)),
+                    Span::styled("Key: ", theme.hint),
                     Span::raw(masked),
-                    Span::styled("▏", Style::new().fg(Color::Cyan)),
+                    Span::styled("▏", theme.cursor),
                 ]));
             }
             Step::Model { picker } => {
                 lines.push(Line::styled(
                     format!("Choose a model for {}.", self.rows[self.selected].title),
-                    Style::new().add_modifier(Modifier::BOLD),
+                    theme.title,
                 ));
                 lines.push(Line::raw(""));
                 let rows = (rect.height as usize).saturating_sub(10);
-                lines.extend(picker.lines(inner, rows));
+                lines.extend(picker.lines(inner, rows, theme));
             }
         }
 
         if let Some((message, is_error)) = &self.message {
             lines.push(Line::raw(""));
-            let color = if *is_error { Color::Red } else { Color::Green };
+            let style = if *is_error {
+                theme.setup_error
+            } else {
+                theme.setup_ok
+            };
             for l in wrap(message, inner) {
-                lines.push(Line::styled(l, Style::new().fg(color)));
+                lines.push(Line::styled(l, style));
             }
         }
 
@@ -347,12 +359,9 @@ impl Screen<'_> {
             Step::Model { .. } => " type to filter · ↑↓ choose · Enter confirm · Esc back ",
         };
         let block = Block::bordered()
-            .title(Line::styled(
-                " Set up Cradle ",
-                Style::new().add_modifier(Modifier::BOLD),
-            ))
+            .title(Line::styled(" Set up Cradle ", theme.title))
             .title_bottom(keys)
-            .border_style(Style::new().fg(Color::Cyan))
+            .border_style(theme.border)
             .padding(Padding::new(1, 1, 1, 0));
         frame.render_widget(Paragraph::new(lines).block(block), rect);
     }

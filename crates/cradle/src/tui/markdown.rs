@@ -6,28 +6,21 @@
 //! it parses.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 use super::text::display_width;
+use super::theme::Theme;
 
-pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
+pub fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let mut r = Renderer::new(width.max(10));
+    let mut r = Renderer::new(width.max(10), theme);
     for event in Parser::new_ext(text, options) {
         r.event(event);
     }
     r.finish()
-}
-
-fn code_style() -> Style {
-    Style::new().fg(Color::Yellow)
-}
-
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
 }
 
 struct List {
@@ -43,7 +36,8 @@ struct Table {
     in_head: bool,
 }
 
-struct Renderer {
+struct Renderer<'t> {
+    theme: &'t Theme,
     width: usize,
     out: Vec<Line<'static>>,
     /// Inline content of the block being built.
@@ -59,9 +53,10 @@ struct Renderer {
     table: Option<Table>,
 }
 
-impl Renderer {
-    fn new(width: usize) -> Self {
+impl<'t> Renderer<'t> {
+    fn new(width: usize, theme: &'t Theme) -> Self {
         Renderer {
+            theme,
             width,
             out: Vec::new(),
             spans: Vec::new(),
@@ -77,6 +72,11 @@ impl Renderer {
 
     fn style(&self) -> Style {
         *self.styles.last().expect("base style")
+    }
+
+    /// Code frames, quote bars, rules, table borders and link URLs.
+    fn dim(&self) -> Style {
+        self.theme.md_punctuation
     }
 
     fn push_style(&mut self, f: impl FnOnce(Style) -> Style) {
@@ -139,7 +139,7 @@ impl Renderer {
                 }
             }
             Event::Code(code) => {
-                let style = self.style().patch(code_style());
+                let style = self.style().patch(self.theme.md_code);
                 self.spans.push(Span::styled(code.into_string(), style));
             }
             Event::SoftBreak => self.spans.push(Span::styled(" ", self.style())),
@@ -147,21 +147,24 @@ impl Renderer {
             Event::Rule => {
                 self.flush();
                 self.out
-                    .push(Line::styled("─".repeat(self.width.min(60)), dim()));
+                    .push(Line::styled("─".repeat(self.width.min(60)), self.dim()));
                 self.blank();
             }
             Event::TaskListMarker(done) => {
                 let mark = if done { "[x] " } else { "[ ] " };
-                self.spans.push(Span::styled(mark, dim()));
+                self.spans.push(Span::styled(mark, self.dim()));
             }
             Event::Html(html) | Event::InlineHtml(html) => {
-                self.spans.push(Span::styled(html.into_string(), dim()));
+                self.spans
+                    .push(Span::styled(html.into_string(), self.dim()));
             }
             Event::FootnoteReference(name) => {
-                self.spans.push(Span::styled(format!("[^{name}]"), dim()));
+                self.spans
+                    .push(Span::styled(format!("[^{name}]"), self.dim()));
             }
             Event::InlineMath(m) | Event::DisplayMath(m) => {
-                self.spans.push(Span::styled(m.into_string(), code_style()));
+                self.spans
+                    .push(Span::styled(m.into_string(), self.theme.md_code));
             }
         }
     }
@@ -172,20 +175,17 @@ impl Renderer {
             Tag::Heading { level, .. } => {
                 self.flush();
                 let style = match level {
-                    HeadingLevel::H1 => Style::new()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                    HeadingLevel::H2 => {
-                        Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
-                    }
-                    _ => Style::new().add_modifier(Modifier::BOLD),
+                    HeadingLevel::H1 => self.theme.md_h1,
+                    HeadingLevel::H2 => self.theme.md_h2,
+                    _ => self.theme.md_heading,
                 };
                 self.styles.push(style);
             }
             Tag::BlockQuote(_) => {
                 self.flush();
                 self.quote_depth += 1;
-                self.push_style(|s| s.add_modifier(Modifier::ITALIC));
+                let quote = self.theme.md_quote;
+                self.push_style(|s| s.patch(quote));
             }
             Tag::CodeBlock(kind) => {
                 self.flush();
@@ -202,7 +202,7 @@ impl Renderer {
                 };
                 let prefix = self.prefix(false);
                 let mut spans = prefix;
-                spans.push(Span::styled(format!("┌ {label}"), dim()));
+                spans.push(Span::styled(format!("┌ {label}"), self.dim()));
                 self.out.push(Line::from(spans));
                 self.code = Some(lang);
             }
@@ -227,12 +227,14 @@ impl Renderer {
             Tag::Strikethrough => self.push_style(|s| s.add_modifier(Modifier::CROSSED_OUT)),
             Tag::Link { dest_url, .. } => {
                 self.links.push(dest_url.into_string());
-                self.push_style(|s| s.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED));
+                let link = self.theme.md_link;
+                self.push_style(|s| s.patch(link));
             }
             Tag::Image { dest_url, .. } => {
                 self.links.push(dest_url.into_string());
-                self.spans.push(Span::styled("[image: ", dim()));
-                self.push_style(|s| s.fg(Color::Cyan));
+                self.spans.push(Span::styled("[image: ", self.dim()));
+                let image = self.theme.md_image;
+                self.push_style(|s| s.patch(image));
             }
             Tag::Table(_) => {
                 self.flush();
@@ -266,7 +268,7 @@ impl Renderer {
             }
             TagEnd::CodeBlock => {
                 let mut spans = self.prefix(false);
-                spans.push(Span::styled("└", dim()));
+                spans.push(Span::styled("└", self.dim()));
                 self.out.push(Line::from(spans));
                 self.code = None;
                 if self.lists.is_empty() {
@@ -289,14 +291,16 @@ impl Renderer {
                 if let Some(url) = self.links.pop() {
                     let text: String = self.spans.iter().map(|s| s.content.as_ref()).collect();
                     if !url.is_empty() && !text.ends_with(&url) {
-                        self.spans.push(Span::styled(format!(" ({url})"), dim()));
+                        self.spans
+                            .push(Span::styled(format!(" ({url})"), self.dim()));
                     }
                 }
             }
             TagEnd::Image => {
                 self.styles.pop();
                 let url = self.links.pop().unwrap_or_default();
-                self.spans.push(Span::styled(format!(" {url}]"), dim()));
+                self.spans
+                    .push(Span::styled(format!(" {url}]"), self.dim()));
             }
             _ => {}
         }
@@ -306,7 +310,7 @@ impl Renderer {
     fn prefix(&mut self, first: bool) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
         for _ in 0..self.quote_depth {
-            spans.push(Span::styled("│ ", dim()));
+            spans.push(Span::styled("│ ", self.dim()));
         }
         if !self.lists.is_empty() {
             let depth = self.lists.len() - 1;
@@ -315,7 +319,7 @@ impl Renderer {
             }
             match (first, &self.item_marker) {
                 (true, Some(marker)) => {
-                    spans.push(Span::styled(marker.clone(), Style::new().fg(Color::Cyan)));
+                    spans.push(Span::styled(marker.clone(), self.theme.md_list_marker));
                     self.item_marker = None;
                 }
                 _ => spans.push(Span::raw("  ")),
@@ -338,12 +342,12 @@ impl Renderer {
     fn code_text(&mut self, text: &str) {
         for line in text.trim_end_matches('\n').split('\n') {
             let mut prefix = self.prefix(false);
-            prefix.push(Span::styled("│ ", dim()));
+            prefix.push(Span::styled("│ ", self.dim()));
             let room = self.width.saturating_sub(spans_width(&prefix)).max(4);
             // Code is hard-wrapped, never reflowed.
             for chunk in hard_wrap(&line.replace('\t', "    "), room) {
                 let mut spans = prefix.clone();
-                spans.push(Span::styled(chunk, code_style()));
+                spans.push(Span::styled(chunk, self.theme.md_code_block));
                 self.out.push(Line::from(spans));
             }
         }
@@ -366,7 +370,7 @@ impl Renderer {
             // Too wide for the terminal: one "a · b · c" paragraph per row.
             for (i, row) in table.rows.iter().enumerate() {
                 let style = if i < table.header_rows {
-                    Style::new().add_modifier(Modifier::BOLD)
+                    self.theme.md_table_header
                 } else {
                     Style::new()
                 };
@@ -383,13 +387,13 @@ impl Renderer {
                 let cell = row.get(c).map(String::as_str).unwrap_or("");
                 let pad = width - display_width(cell);
                 let style = if i < table.header_rows {
-                    Style::new().add_modifier(Modifier::BOLD)
+                    self.theme.md_table_header
                 } else {
                     Style::new()
                 };
                 spans.push(Span::styled(format!("{cell}{}", " ".repeat(pad)), style));
                 if c + 1 < columns {
-                    spans.push(Span::styled(" │ ", dim()));
+                    spans.push(Span::styled(" │ ", self.dim()));
                 }
             }
             self.out.push(Line::from(spans));
@@ -400,7 +404,7 @@ impl Renderer {
                     .map(|w| "─".repeat(*w))
                     .collect::<Vec<_>>()
                     .join("─┼─");
-                rule.push(Span::styled(line, dim()));
+                rule.push(Span::styled(line, self.dim()));
                 self.out.push(Line::from(rule));
             }
         }
@@ -525,7 +529,14 @@ fn wrap_spans(
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Color;
+
     use super::*;
+
+    /// Rendered with the default (dark) theme.
+    fn render(text: &str, width: usize) -> Vec<Line<'static>> {
+        super::render(text, width, &Theme::default())
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines

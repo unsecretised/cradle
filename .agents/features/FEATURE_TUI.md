@@ -20,6 +20,8 @@ Model output is rendered as markdown with pulldown-cmark.
 - **Header**: provider/model and the current mode.
 - A chat-only provider (`tools = false`) is announced in the conversation when it becomes
   active ("chat only, no file access"), and marked `[chat only]` by `cradle providers`.
+- **Theme** (`theme.rs`, `themes/`): every colour comes from `~/.config/cradle/theme.toml`
+  on top of a dark or light preset (see `FEATURE_THEME.md`).
 - Trust and `.agents/`-vs-`agents.toml` prompts at startup are asked on plain stdin before
   the TUI starts.
 
@@ -27,7 +29,7 @@ Model output is rendered as markdown with pulldown-cmark.
 
 `/help`, `/clear`, `/mode [name]`, `/plan`, `/build`, `/model [provider/model]` (also
 switches provider; model picker in `picker.rs`), `/review user|subagent`, `/diff`,
-`/session`, `/sidebar`, `/skill <name> [request]`, `/quit`. Aliases: `/models`,
+`/session`, `/sidebar`, `/skill <name> [request]`, `/theme [reload]`, `/quit`. Aliases: `/models`,
 `/sessions`, `/resume`, `/skills`, `/exit`. Suggestions appear while typing, and Tab
 completes them.
 

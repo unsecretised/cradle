@@ -19,6 +19,11 @@ pub fn user_config() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
 
+/// The TUI theme: `<config_dir>/theme.toml`.
+pub fn theme() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("theme.toml"))
+}
+
 /// The runtime providers overlay: `<config_dir>/providers.toml`.
 pub fn providers_overlay() -> Option<PathBuf> {
     config_dir().map(|d| d.join("providers.toml"))

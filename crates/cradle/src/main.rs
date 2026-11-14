@@ -58,6 +58,12 @@ enum Command {
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },
+    /// Check ~/.config/cradle/theme.toml, or print a commented example.
+    Theme {
+        /// Print the built-in dark theme, with every setting explained.
+        #[arg(long)]
+        example: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -113,6 +119,10 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Some(Command::Providers) => inspect::list_providers(),
         Some(Command::Config { root, source }) => config(&root, source),
+        Some(Command::Theme { example }) => {
+            theme(example);
+            Ok(())
+        }
         None => run(cli.run).await,
     };
     match result {
@@ -135,6 +145,35 @@ fn config(root: &std::path::Path, source: Option<SourceArg>) -> Result<(), Error
     };
     inspect::print_config(&config);
     Ok(())
+}
+
+/// `cradle theme`: where the theme comes from and any problems in it. Problems are not
+/// errors: the TUI starts anyway and fills in from the preset.
+fn theme(example: bool) {
+    if example {
+        print!("{}", tui::theme::DARK);
+        return;
+    }
+    let path = cradle_config::paths::theme();
+    let (theme, warnings) = tui::theme::load(path.as_deref());
+    match &path {
+        None => println!("No config directory; using the {} preset.", theme.preset),
+        Some(p) if p.is_file() => {
+            println!("{} (on the {} preset)", p.display(), theme.preset)
+        }
+        Some(p) => {
+            println!("No {}; using the {} preset.", p.display(), theme.preset);
+            println!("Start one with: cradle theme --example > {}", p.display());
+        }
+    }
+    if warnings.is_empty() {
+        println!("No problems.");
+    } else {
+        println!("{} problem(s), skipped:", warnings.len());
+        for w in warnings {
+            println!("  {w}");
+        }
+    }
 }
 
 async fn run(args: RunArgs) -> Result<(), Error> {

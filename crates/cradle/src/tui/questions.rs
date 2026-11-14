@@ -7,11 +7,12 @@
 use cradle_core::Answer;
 use cradle_tools::{Question, QuestionKind};
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use tokio::sync::oneshot;
 
 use super::text::{Input, display_width, wrap};
+use super::theme::Theme;
 
 pub(crate) struct Questions {
     questions: Vec<Question>,
@@ -217,12 +218,12 @@ impl Questions {
 
     /// The modal body, at most `rows` lines where possible. Earlier answers are shown
     /// above the current question, the oldest dropped first when space runs out.
-    pub fn lines(&self, width: usize, rows: usize) -> Vec<Line<'static>> {
-        let dim = Style::new().fg(Color::DarkGray);
+    pub fn lines(&self, width: usize, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let dim = theme.hint;
         let q = self.question();
         let mut body: Vec<Line<'static>> = Vec::new();
         for l in wrap(&q.question, width) {
-            body.push(Line::styled(l, Style::new().add_modifier(Modifier::BOLD)));
+            body.push(Line::styled(l, theme.title));
         }
         body.push(Line::raw(""));
         for (i, option) in q.options.iter().enumerate() {
@@ -233,7 +234,7 @@ impl Questions {
                 _ => "",
             };
             let style = if i == self.selected && self.input.is_empty() {
-                Style::new().fg(Color::Black).bg(Color::Cyan)
+                theme.selection
             } else {
                 Style::new()
             };
@@ -249,7 +250,7 @@ impl Questions {
         body.push(Line::from(vec![
             Span::styled(label, dim),
             Span::raw(self.input.text().replace('\n', " ")),
-            Span::styled("▏", Style::new().fg(Color::Cyan)),
+            Span::styled("▏", theme.cursor),
         ]));
         if self.confirm_dismiss {
             body.push(Line::raw(""));
@@ -263,7 +264,7 @@ impl Questions {
                 format!(
                     "Dismiss {what}? Answers so far will be lost. [y] dismiss · [n] keep answering"
                 ),
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                theme.confirm,
             ));
         }
 
