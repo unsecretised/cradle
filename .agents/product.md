@@ -14,12 +14,14 @@ project and keeps that agent inside rules the project and the user define.
   or opens PRs on its own.
 - **Project config has to be trusted.** Modes, commands and soul overrides from a project are
   shown to the user for approval, and approved again whenever they change.
-- **Soul.** User-level behaviour preferences (ask more or fewer questions, verify builds
+- **Soul (planned).** User-level behaviour preferences (ask more or fewer questions, verify builds
   automatically, technical vs. non-technical audience). A project can override them, with
   the user's approval.
 - **Custom modes.** Plan and build are the defaults, and a project can add its own (e.g. a
   debug mode). `clash_handler` decides how project modes interact with the user's global
-  modes.
+  modes. A built-in scaffold mode sets up `.agents/` for a new project.
+- **Skills.** Reusable task instructions in `.agents/skills/`, listed to the agent and
+  runnable with `/skill`.
 - **Several backends.** Direct APIs (Anthropic, OpenAI-compatible) using API keys, plus the
   Claude Code and Codex CLIs, which let people use their existing subscriptions. Providers
   are declared in `providers.toml`, compiled in, and can be extended at runtime.
@@ -31,4 +33,6 @@ knowledge kept in a structured form that both people and agents can maintain.
 
 ## Status
 
-Pre-alpha. Design is settled (see `roadmap/`). Code is a stub `main.rs`.
+Pre-alpha, but usable: the workspace, TUI, all four backend kinds, trust, modes, sessions
+and skills are implemented (see `features.md`). Not started yet: Soul, a command sandbox and
+the ACP front end (see `roadmap/`).

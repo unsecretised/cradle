@@ -1,21 +1,28 @@
 # Features
 
-Overview of the implemented features in `features/`.
+Implemented features, with details in `features/`.
 
-None yet. All planned work lives in `roadmap/`:
-
-| Roadmap item | Summary |
+| Feature | Summary |
 |---|---|
-| [WORKSPACE](roadmap/FEATURE_WORKSPACE.md) | Turn the single crate into the Cargo workspace |
-| [CONFIG_LOADING](roadmap/FEATURE_CONFIG_LOADING.md) | Load `.agents/` or `agents.toml` into one model; warn on clash |
-| [TRUST](roadmap/FEATURE_TRUST.md) | Approve project config by hash; re-prompt when it changes |
-| [MODES](roadmap/FEATURE_MODES.md) | Plan/build/custom modes, `clash_handler`, mode switching |
+| [WORKSPACE](features/FEATURE_WORKSPACE.md) | Seven-crate Cargo workspace with shared dependencies |
+| [CONFIG_LOADING](features/FEATURE_CONFIG_LOADING.md) | `.agents/` or `agents.toml` into one `ProjectConfig`; always-loaded vs on-demand docs |
+| [TRUST](features/FEATURE_TRUST.md) | Approve project config by snapshot hash; diff and re-ask when it changes |
+| [MODES](features/FEATURE_MODES.md) | Plan/build/scaffold + extra modes, read/full access, `clash_handler`, mode commands, reviewer subagent |
+| [SCAFFOLD_MODE](features/FEATURE_SCAFFOLD_MODE.md) | Built-in mode that sets up `.agents/`, the only one allowed to write project config |
+| [SKILLS](features/FEATURE_SKILLS.md) | Task instructions in `.agents/skills/`, listed in the prompt, run with `/skill` |
+| [TOOLS](features/FEATURE_TOOLS.md) | Typed file tools, path guard, protected files, `[commands]` runner, no raw shell |
+| [CONTENT_HYGIENE](features/FEATURE_CONTENT_HYGIENE.md) | Invisible characters shown as `<U+XXXX>` in everything the model reads |
+| [PROVIDERS_TOML](features/FEATURE_PROVIDERS_TOML.md) | Compile-time `providers.toml` + runtime overlay merged by `id` |
+| [API_BACKENDS](features/FEATURE_API_BACKENDS.md) | Anthropic + OpenAI-compatible adapters; env var or keychain keys |
+| [CLI_BACKENDS](features/FEATURE_CLI_BACKENDS.md) | Claude Code + Codex with built-in tools off, Cradle's tools over a local MCP server |
+| [SESSIONS](features/FEATURE_SESSIONS.md) | JSONL transcripts, `--continue`, `/session` |
+| [TUI](features/FEATURE_TUI.md) | ratatui interface: setup screen, approvals, diffs, sidebar, slash commands |
+
+## Roadmap
+
+| Item | Summary |
+|---|---|
 | [SOUL](roadmap/FEATURE_SOUL.md) | Global behaviour preferences; project override with approval |
-| [TOOLS](roadmap/FEATURE_TOOLS.md) | Typed tools, path guard, `[commands]` runner, no raw shell |
-| [DOC_PROPOSALS](roadmap/FEATURE_DOC_PROPOSALS.md) | Agent proposes `.agents/` edits as diffs for approval |
-| [PROVIDERS_TOML](roadmap/FEATURE_PROVIDERS_TOML.md) | Compile-time `providers.toml` + runtime merge |
-| [API_BACKENDS](roadmap/FEATURE_API_BACKENDS.md) | Anthropic + OpenAI-compatible adapters, keychain keys |
-| [CLI_BACKENDS](roadmap/FEATURE_CLI_BACKENDS.md) | Claude Code + Codex via an MCP tool server |
-| [SESSIONS](roadmap/FEATURE_SESSIONS.md) | JSONL transcripts, `/resume` |
-| [TUI](roadmap/FEATURE_TUI.md) | ratatui interface, approvals, diff views |
+| [DOC_PROPOSALS](roadmap/FEATURE_DOC_PROPOSALS.md) | Batched `.agents/` proposals (approved per-write edits already exist) |
+| [SANDBOX](roadmap/FEATURE_SANDBOX.md) | Sandbox for `[commands]` |
 | [ACP_AGENT](roadmap/FEATURE_ACP_AGENT.md) | Later: run Cradle inside ACP editors |

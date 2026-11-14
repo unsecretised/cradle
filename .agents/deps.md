@@ -1,47 +1,48 @@
 # Dependencies
 
 Versions are pinned once in the root `[workspace.dependencies]`. Crates use
-`dep = { workspace = true }`.
+`dep.workspace = true`.
 
-## Declared now
+## In use
+
+| Crate | Used by | Purpose | Docs |
+|---|---|---|---|
+| clap | cradle | CLI argument parsing | https://docs.rs/clap |
+| ratatui | cradle | TUI rendering | https://docs.rs/ratatui · https://ratatui.rs |
+| crossterm (event-stream) | cradle | Terminal backend and input events | https://docs.rs/crossterm |
+| pulldown-cmark | cradle | Render model markdown in the TUI | https://docs.rs/pulldown-cmark |
+| unicode-width | cradle | Text wrapping and layout | https://docs.rs/unicode-width |
+| futures-util | cradle, backends | Stream utilities (SSE, terminal events) | https://docs.rs/futures-util |
+| tokio | most crates | Async runtime, processes, MCP sockets | https://docs.rs/tokio · https://tokio.rs |
+| serde | most crates | (De)serialization | https://serde.rs |
+| serde_json | core, tools, backends, mcp | API payloads, JSONL sessions, CLI streams, MCP | https://docs.rs/serde_json |
+| toml | config, core, provider-spec | `.agents` TOML, `providers.toml`, `trust.toml` | https://docs.rs/toml |
+| thiserror | all | Error types (every crate, including the bin) | https://docs.rs/thiserror |
+| reqwest (json, stream) | backends | HTTP to providers | https://docs.rs/reqwest |
+| keyring | backends | API keys in the OS keychain | https://docs.rs/keyring |
+| semver | backends, provider-spec | CLI backend version ranges | https://docs.rs/semver |
+| url | provider-spec | Validate `base_url` | https://docs.rs/url |
+| ignore | tools | `.gitignore` matching in the path guard | https://docs.rs/ignore |
+| globset | tools | Protected and secret file patterns, `glob` arguments | https://docs.rs/globset |
+| regex | tools | `search` tool | https://docs.rs/regex |
+| shlex | tools | Split `[commands]` lines without a shell | https://docs.rs/shlex |
+| similar | tools, core | Diffs for edits and trust prompts | https://docs.rs/similar |
+| sha2 | core | Trust hashes, session directory names | https://docs.rs/sha2 |
+| hex | core, mcp | Hash and token encoding | https://docs.rs/hex |
+| getrandom | mcp | MCP bearer token | https://docs.rs/getrandom |
+| tempfile | backends (+ dev) | Private MCP config file for Claude Code; test dirs | https://docs.rs/tempfile |
+
+## Later
 
 | Crate | Purpose | Docs |
 |---|---|---|
-| clap 4.6 | CLI argument parsing | https://docs.rs/clap · https://crates.io/crates/clap |
-| ratatui 0.30 | TUI rendering | https://docs.rs/ratatui · https://ratatui.rs |
-
-## Planned
-
-| Crate | Purpose | Docs |
-|---|---|---|
-| serde | (De)serialization | https://serde.rs · https://docs.rs/serde |
-| toml | Parse `.agents` TOML, `providers.toml` | https://docs.rs/toml |
-| toml_edit | Only if Cradle rewrites config and must keep comments | https://docs.rs/toml_edit |
-| serde_json | API payloads, JSONL sessions, CLI stream parsing | https://docs.rs/serde_json |
-| tokio | Async runtime, processes | https://docs.rs/tokio · https://tokio.rs |
-| reqwest (rustls, stream) | HTTP to providers | https://docs.rs/reqwest |
-| eventsource-stream | SSE parsing for streaming responses | https://docs.rs/eventsource-stream |
-| futures | Stream utilities | https://docs.rs/futures |
-| schemars | JSON Schema for tool definitions | https://docs.rs/schemars |
-| thiserror / anyhow | Errors (libs / bin) | https://docs.rs/thiserror · https://docs.rs/anyhow |
-| tracing | Logging | https://docs.rs/tracing |
-| crossterm | Terminal backend for ratatui | https://docs.rs/crossterm |
-| tui-textarea | Input box | https://docs.rs/tui-textarea |
-| pulldown-cmark | Render markdown in TUI | https://docs.rs/pulldown-cmark |
-| ignore, globset | File walking that respects `.gitignore` | https://docs.rs/ignore · https://docs.rs/globset |
-| similar | Diffs for edit / doc-proposal views | https://docs.rs/similar |
-| dunce | Path canonicalisation (cross-platform) | https://docs.rs/dunce |
-| directories | Config / data dir locations | https://docs.rs/directories |
-| keyring | API keys in OS keychain | https://docs.rs/keyring |
-| sha2 | Trust hashes | https://docs.rs/sha2 |
-| semver | CLI backend version ranges | https://docs.rs/semver |
-| url | Validate `base_url` | https://docs.rs/url |
-| rmcp | MCP server for CLI backends | https://docs.rs/rmcp · https://github.com/modelcontextprotocol/rust-sdk |
-| agent-client-protocol | Later: expose Cradle as an ACP agent | https://docs.rs/agent-client-protocol · https://agentclientprotocol.com |
+| agent-client-protocol | Expose Cradle as an ACP agent | https://docs.rs/agent-client-protocol · https://agentclientprotocol.com |
 
 ## External APIs and tools
 
 - Anthropic Messages API: https://docs.claude.com/en/api/messages
 - OpenAI Chat Completions (and compatibles): https://platform.openai.com/docs/api-reference/chat
+- MCP (streamable HTTP): https://modelcontextprotocol.io
 - Claude Code CLI: `claude --help`, https://docs.claude.com/en/docs/claude-code
-- Codex CLI: `codex exec --help`, https://github.com/openai/codex (flags still unverified)
+  (developed against 2.1.311)
+- Codex CLI: `codex exec --help`, https://github.com/openai/codex (checked against 0.169.0)

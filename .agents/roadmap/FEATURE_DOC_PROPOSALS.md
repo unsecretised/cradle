@@ -1,12 +1,17 @@
 # `.agents/` doc proposals
 
-The agent keeps the docs up to date without writing to them directly.
+The agent keeps the docs up to date without changing them behind the user's back.
 
-## Decisions
+## Already built (see `features/FEATURE_TOOLS.md`)
 
-- `propose_agents_edit(path, new_content, reason)` queues a proposal.
-- The TUI shows a diff (made with `similar`). The user accepts or rejects it, and only an
-  accepted proposal is written.
-- Proposals are never allowed for `RULES.md`, `modes.toml` or `modes/`.
-- Typical uses: moving roadmap → features, updating `features.md`, `architecture.md`,
-  `deps.md` and `TESTS.md`, writing `bugfixes/BUGFIX_*.md`.
+- `write_file` / `edit_file` on an `.agents/` doc always shows a diff and needs the
+  user's approval, whatever the mode's `file_edits` setting.
+- `RULES.md`, `modes.toml`, `modes/` and `agents.toml` are refused outside scaffold mode.
+
+## Still open
+
+- A dedicated `propose_agents_edit(path, new_content, reason)` tool that queues proposals
+  for review together, instead of approving each write as it happens. Decide whether this
+  is still wanted.
+- Typical uses to support: moving roadmap → features, updating `features.md`,
+  `architecture.md`, `deps.md` and `TESTS.md`, writing `bugfixes/BUGFIX_*.md`.
