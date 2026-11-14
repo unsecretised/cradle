@@ -12,6 +12,10 @@ Model output is rendered as markdown with pulldown-cmark.
   and searches are grouped and can be expanded (Ctrl+O).
 - **Approvals**: diffs for writes and config changes, command approvals, and `ask_user`
   questions. The user can approve, decline, or ask for changes.
+- **Questions** (`questions.rs`): `ask_user` questions are shown one at a time ("2 of 5"),
+  with earlier answers above. Single choice: ↑↓/Enter or 1-9,0; multi choice: Space or
+  digits toggle; either can take a typed answer of the user's own. Shift+Tab goes back.
+  Esc dismisses the batch, asking first once anything has been answered or typed.
 - **Sidebar**: changed files and usage. Hidden on narrow terminals, toggled with `/sidebar`.
 - **Header**: provider/model and the current mode.
 - A chat-only provider (`tools = false`) is announced in the conversation when it becomes

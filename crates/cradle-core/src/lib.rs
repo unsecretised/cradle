@@ -10,7 +10,7 @@ pub mod session;
 pub mod trust;
 
 pub use agent::{
-    AgentCommand, AgentEvent, AgentHandle, AgentSetup, Approval, ApprovalRequest, FileStat,
+    AgentCommand, AgentEvent, AgentHandle, AgentSetup, Answer, Approval, ApprovalRequest, FileStat,
     QuestionRequest, ReviewPolicy, spawn,
 };
 pub use modes::{ActiveMode, Clash, ClashChoice, ModeSet};

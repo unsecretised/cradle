@@ -4,6 +4,7 @@ mod commands;
 mod markdown;
 mod onboard;
 mod picker;
+mod questions;
 mod text;
 mod tools;
 mod view;
@@ -36,6 +37,7 @@ use crate::Error;
 use crate::setup::Session;
 use cradle_core::AgentSetup;
 use picker::{ModelPicker, PickerAction};
+use questions::Questions;
 use text::Input;
 
 /// Mouse button and wheel reports (SGR encoding), without motion tracking, which would
@@ -208,13 +210,7 @@ pub(crate) enum Modal {
         /// What to change instead, while the user types it (after `c`).
         feedback: Option<Input>,
     },
-    Question {
-        question: String,
-        options: Vec<String>,
-        selected: usize,
-        input: Input,
-        reply: Option<oneshot::Sender<String>>,
-    },
+    Question(Questions),
     Help,
     Model(ModelPicker),
     Session {
@@ -394,13 +390,7 @@ impl App {
                 })
             }
             AgentEvent::Question(req) => {
-                self.modal = Some(Modal::Question {
-                    question: req.question,
-                    options: req.options,
-                    selected: 0,
-                    input: Input::default(),
-                    reply: Some(req.reply),
-                })
+                self.modal = Some(Modal::Question(Questions::new(req.questions, req.reply)))
             }
             AgentEvent::ModeChanged { name, read_only } => {
                 if name != self.mode {
@@ -450,7 +440,7 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key, handle),
             Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Paste(text) => match &mut self.modal {
-                Some(Modal::Question { input, .. })
+                Some(Modal::Question(Questions { input, .. }))
                 | Some(Modal::Approval {
                     feedback: Some(input),
                     ..
@@ -748,54 +738,10 @@ impl App {
                     self.modal = None;
                 }
             }
-            Modal::Question {
-                options,
-                selected,
-                input,
-                reply,
-                ..
-            } => {
-                let answer = match key.code {
-                    KeyCode::Esc => {
-                        // Dropping the sender tells the agent the question was dismissed.
-                        self.modal = None;
-                        return;
-                    }
-                    KeyCode::Up => {
-                        *selected = selected.saturating_sub(1);
-                        None
-                    }
-                    KeyCode::Down if !options.is_empty() => {
-                        *selected = (*selected + 1).min(options.len() - 1);
-                        None
-                    }
-                    KeyCode::Enter if !input.is_empty() => Some(input.take()),
-                    KeyCode::Enter => options.get(*selected).cloned(),
-                    KeyCode::Char(c @ '1'..='9') if input.is_empty() => {
-                        options.get(c as usize - '1' as usize).cloned()
-                    }
-                    KeyCode::Char(c) => {
-                        input.insert(c);
-                        None
-                    }
-                    KeyCode::Backspace => {
-                        input.backspace();
-                        None
-                    }
-                    KeyCode::Left => {
-                        input.left();
-                        None
-                    }
-                    KeyCode::Right => {
-                        input.right();
-                        None
-                    }
-                    _ => None,
-                };
-                if let Some(answer) = answer {
-                    if let Some(reply) = reply.take() {
-                        let _ = reply.send(answer);
-                    }
+            Modal::Question(questions) => {
+                // Closing without sending drops the sender, which tells the agent the
+                // questions were dismissed.
+                if questions.on_key(key) {
                     self.modal = None;
                 }
             }
@@ -1417,6 +1363,158 @@ mod tests {
             &handle,
         );
         assert!(!screen(&app).contains("src/alpha.rs"));
+    }
+
+    fn ask(
+        app: &mut App,
+        questions: Vec<cradle_tools::Question>,
+    ) -> oneshot::Receiver<Vec<cradle_core::Answer>> {
+        let (reply, answers) = oneshot::channel();
+        app.on_agent(AgentEvent::Question(cradle_core::QuestionRequest {
+            questions,
+            reply,
+        }));
+        answers
+    }
+
+    fn question(
+        text: &str,
+        kind: cradle_tools::QuestionKind,
+        options: &[&str],
+    ) -> cradle_tools::Question {
+        cradle_tools::Question {
+            question: text.into(),
+            kind,
+            options: options.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn questions_step_through_each_kind() {
+        use cradle_core::Answer;
+        use cradle_tools::QuestionKind as K;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, handle) = start(dir.path());
+        let ten: Vec<String> = (1..=10).map(|i| format!("opt{i}")).collect();
+        let ten: Vec<&str> = ten.iter().map(String::as_str).collect();
+        let answers = ask(
+            &mut app,
+            vec![
+                question("Pick a backend?", K::Single, &["http", "cli"]),
+                question("Which crates?", K::Multi, &["core", "tools", "tui"]),
+                question("Why?", K::Text, &[]),
+                question("Own answer?", K::Single, &["a", "b"]),
+                question("Tenth?", K::Single, &ten),
+            ],
+        );
+        let s = screen(&app);
+        assert!(
+            s.contains("The agent asks (1 of 5)") && s.contains("1. http"),
+            "{s}"
+        );
+        assert!(!s.contains("⇧Tab back"), "{s}");
+
+        // Single: a digit picks and moves on.
+        press(&mut app, &handle, KeyCode::Char('2'));
+        let s = screen(&app);
+        assert!(
+            s.contains("(2 of 5)") && s.contains("✓ Pick a backend?: cli"),
+            "{s}"
+        );
+        assert!(s.contains("1. [ ] core") && s.contains("⇧Tab back"), "{s}");
+
+        // Multi: Enter with nothing ticked does nothing; Space and digits toggle.
+        press(&mut app, &handle, KeyCode::Enter);
+        assert!(screen(&app).contains("(2 of 5)"));
+        press(&mut app, &handle, KeyCode::Char(' '));
+        press(&mut app, &handle, KeyCode::Char('3'));
+        assert!(screen(&app).contains("3. [x] tui"));
+        // Once typing, Space and digits are text.
+        type_text(&mut app, &handle, "cli 2");
+        press(&mut app, &handle, KeyCode::Enter);
+
+        // Text: empty Enter does nothing.
+        assert!(screen(&app).contains("(3 of 5)"));
+        press(&mut app, &handle, KeyCode::Enter);
+        assert!(screen(&app).contains("(3 of 5)"));
+        type_text(&mut app, &handle, "speed");
+
+        // Back restores the multi answer, ticks and own text included.
+        press(&mut app, &handle, KeyCode::BackTab);
+        let s = screen(&app);
+        assert!(s.contains("(2 of 5)") && s.contains("1. [x] core"), "{s}");
+        assert!(
+            s.contains("2. [ ] tools") && s.contains("Or your own: cli 2"),
+            "{s}"
+        );
+        press(&mut app, &handle, KeyCode::Enter);
+        assert!(
+            screen(&app).contains("Answer: speed"),
+            "kept on the way back"
+        );
+        press(&mut app, &handle, KeyCode::Enter);
+
+        // Single with an own answer.
+        type_text(&mut app, &handle, "neither");
+        press(&mut app, &handle, KeyCode::Enter);
+
+        // `0` picks the tenth option and sends everything.
+        assert!(screen(&app).contains("1-9,0 pick"));
+        press(&mut app, &handle, KeyCode::Char('0'));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            answers.await.unwrap(),
+            [
+                Answer::Choice("cli".into()),
+                Answer::Choices {
+                    picked: vec!["core".into(), "tui".into()],
+                    other: Some("cli 2".into())
+                },
+                Answer::Text("speed".into()),
+                Answer::Text("neither".into()),
+                Answer::Choice("opt10".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissing_questions_asks_first_once_started() {
+        use cradle_tools::QuestionKind as K;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, handle) = start(dir.path());
+
+        // Nothing done yet: Esc dismisses at once.
+        let untouched = ask(
+            &mut app,
+            vec![question("Q1?", K::Text, &[]), question("Q2?", K::Text, &[])],
+        );
+        press(&mut app, &handle, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        assert!(untouched.await.is_err(), "the sender was dropped");
+
+        let answers = ask(
+            &mut app,
+            vec![question("Q1?", K::Text, &[]), question("Q2?", K::Text, &[])],
+        );
+        type_text(&mut app, &handle, "one");
+        press(&mut app, &handle, KeyCode::Enter);
+        press(&mut app, &handle, KeyCode::Esc);
+        let s = screen(&app);
+        assert!(
+            s.contains("Dismiss all 2 questions?") && s.contains("y dismiss all"),
+            "{s}"
+        );
+        type_text(&mut app, &handle, "n");
+        assert!(app.modal.is_some(), "n keeps answering");
+        assert!(!screen(&app).contains("Dismiss all"));
+        assert!(
+            matches!(&app.modal, Some(Modal::Question(q)) if q.input.is_empty()),
+            "the n was not typed"
+        );
+        press(&mut app, &handle, KeyCode::Esc);
+        type_text(&mut app, &handle, "y");
+        assert!(app.modal.is_none());
+        assert!(answers.await.is_err(), "the sender was dropped");
     }
 
     #[tokio::test]

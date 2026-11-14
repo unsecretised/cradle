@@ -12,7 +12,7 @@ policy (which mode gets which tool, approvals) lives in `cradle-core/src/agent.r
 | `list_files` | read | Optional directory and glob; max 1000 entries |
 | `search` | read | Regex over contents; max 200 matches |
 | `git_diff` | read | `git diff` (optionally `--cached`, a path). The only git operation |
-| `ask_user` | read | A question with optional choices |
+| `ask_user` | read | One or more questions, no limit: `single` or `multi` choice (2–10 options, own answer allowed) or short `text` |
 | `write_file` | write | Shows a diff for approval (depending on the mode's `file_edits`) |
 | `edit_file` | write | Exact string replace, unique unless `replace_all` |
 | `run_command` | write | A command *name* from `[commands]` or the mode's commands, plus a reason |

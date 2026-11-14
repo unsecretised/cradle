@@ -599,40 +599,17 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                 frame.render_widget(Paragraph::new(feedback_lines), area);
             }
         }
-        Modal::Question {
-            question,
-            options,
-            selected,
-            input,
-            ..
-        } => {
-            let mut lines: Vec<Line> = Vec::new();
-            for l in wrap(question, inner_width) {
-                lines.push(Line::styled(l, Style::new().add_modifier(Modifier::BOLD)));
-            }
-            lines.push(Line::raw(""));
-            for (i, option) in options.iter().enumerate() {
-                let style = if i == *selected && input.is_empty() {
-                    Style::new().fg(Color::Black).bg(Color::Cyan)
-                } else {
-                    Style::new()
-                };
-                lines.push(Line::styled(format!(" {}. {option} ", i + 1), style));
-            }
-            if !options.is_empty() {
-                lines.push(Line::raw(""));
-            }
-            lines.push(Line::from(vec![
-                Span::styled("Answer: ", dim()),
-                Span::raw(input.text().replace('\n', " ")),
-                Span::styled("▏", Style::new().fg(Color::Cyan)),
-            ]));
+        Modal::Question(questions) => {
+            let rows = rect.height.saturating_sub(2) as usize;
             let block = Block::bordered()
-                .title(" The agent asks ")
-                .title_bottom(" ↑↓ select · 1-9 pick · type your own · Enter send · Esc dismiss ")
+                .title(questions.title())
+                .title_bottom(questions.hint())
                 .border_style(Style::new().fg(Color::Cyan))
                 .padding(ratatui::widgets::Padding::horizontal(1));
-            frame.render_widget(Paragraph::new(lines).block(block), rect);
+            frame.render_widget(
+                Paragraph::new(questions.lines(inner_width, rows)).block(block),
+                rect,
+            );
         }
         Modal::Model(picker) => {
             let rows = (rect.height as usize).saturating_sub(8);

@@ -11,8 +11,8 @@ pub mod specs;
 
 pub use guard::{GuardError, PathGuard, Resolved, WriteClass};
 pub use specs::{
-    Access, ActivityKind, FileRange, ToolActivity, ToolCall, ToolDefinition, definitions,
-    parse_call,
+    Access, ActivityKind, FileRange, MAX_OPTIONS, Question, QuestionKind, ToolActivity, ToolCall,
+    ToolDefinition, definitions, parse_call,
 };
 
 /// A tool failure, reported back to the model as an error result.

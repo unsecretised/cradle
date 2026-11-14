@@ -25,7 +25,8 @@ use cradle_config::{Detection, ModeAccess, ProjectConfig, SourceKind};
 use cradle_mcp::{McpServer, McpTool, ToolReply, ToolRequest};
 use cradle_tools::hygiene::reveal_invisible;
 use cradle_tools::{
-    Access, PathGuard, ToolActivity, ToolCall, ToolDefinition, ToolError, WriteClass, command,
+    Access, PathGuard, Question, QuestionKind, ToolActivity, ToolCall, ToolDefinition, ToolError,
+    WriteClass, command,
 };
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -126,11 +127,55 @@ pub enum Approval {
     Change(String),
 }
 
+/// One or more questions for the user, answered in order. Dropping `reply` dismisses them.
 #[derive(Debug)]
 pub struct QuestionRequest {
-    pub question: String,
-    pub options: Vec<String>,
-    pub reply: oneshot::Sender<String>,
+    pub questions: Vec<Question>,
+    /// One answer per question, in the same order.
+    pub reply: oneshot::Sender<Vec<Answer>>,
+}
+
+/// The user's answer to one [`Question`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// One of the options.
+    Choice(String),
+    /// Options picked on a multi-choice question, plus an own answer if typed.
+    Choices {
+        picked: Vec<String>,
+        other: Option<String>,
+    },
+    /// Typed text: the answer to a text question, or an own answer to a choice question.
+    Text(String),
+}
+
+/// The tool result for answered questions. `questions` and `answers` are in the same order.
+fn format_answers(questions: &[Question], answers: &[Answer]) -> String {
+    let answer = |q: &Question, a: &Answer| match a {
+        Answer::Choice(c) => c.clone(),
+        Answer::Choices { picked, other } => {
+            let mut parts = Vec::new();
+            if !picked.is_empty() {
+                parts.push(picked.join(", "));
+            }
+            if let Some(other) = other {
+                parts.push(format!("other: \"{other}\""));
+            }
+            parts.join("; ")
+        }
+        Answer::Text(t) if q.kind == QuestionKind::Text => t.clone(),
+        Answer::Text(t) => format!("(own answer) {t}"),
+    };
+    match (questions, answers) {
+        ([q], [a]) => format!("The user answered: {}", answer(q, a)),
+        _ => {
+            let mut text = "The user answered:".to_owned();
+            for (n, (q, a)) in questions.iter().zip(answers).enumerate() {
+                text.push_str(&format!("\n{}. {}\n   {}", n + 1, q.question, answer(q, a)));
+            }
+            text
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -675,16 +720,18 @@ impl Agent {
         );
         let (reply, answer) = oneshot::channel();
         self.emit(AgentEvent::Question(QuestionRequest {
-            question: format!(
-                "Both your global config and this project define these modes: {}. Which \
-                 should apply?",
-                names.join(", ")
-            ),
-            options: vec![override_label.to_owned(), combine_label.to_owned()],
+            questions: vec![Question::single(
+                format!(
+                    "Both your global config and this project define these modes: {}. Which \
+                     should apply?",
+                    names.join(", ")
+                ),
+                vec![override_label.to_owned(), combine_label.to_owned()],
+            )],
             reply,
         }));
         let choice = match answer.await.as_deref() {
-            Ok(a) if a == combine_label => ClashChoice::Combine,
+            Ok([Answer::Choice(a)]) if a == combine_label => ClashChoice::Combine,
             _ => ClashChoice::Override,
         };
         if let Some(store) = store.as_mut() {
@@ -1095,17 +1142,25 @@ impl Agent {
                 }
                 command::git_diff(self.guard.root(), path.as_deref(), staged).await
             }
-            ToolCall::AskUser { question, options } => {
-                let (reply, answer) = oneshot::channel();
+            ToolCall::AskUser { questions } => {
+                let (reply, answers) = oneshot::channel();
                 self.emit(AgentEvent::Question(QuestionRequest {
-                    question,
-                    options,
+                    questions: questions.clone(),
                     reply,
                 }));
-                answer
-                    .await
-                    .map(|a| format!("The user answered: {a}"))
-                    .map_err(|_| ToolError::new("The question was dismissed."))
+                let dismissed = || {
+                    ToolError::new(if questions.len() == 1 {
+                        "The question was dismissed."
+                    } else {
+                        "The questions were dismissed."
+                    })
+                };
+                match answers.await {
+                    Ok(answers) if answers.len() == questions.len() => {
+                        Ok(format_answers(&questions, &answers))
+                    }
+                    _ => Err(dismissed()),
+                }
             }
             ToolCall::WriteFile { path, content } => {
                 // Only the built-in scaffold mode may write project config; config
@@ -1559,6 +1614,46 @@ mod tests {
     fn counts_diff_lines() {
         let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n same\n";
         assert_eq!(diff_counts(diff), (2, 1));
+    }
+
+    #[test]
+    fn formats_answers() {
+        let single = Question::single("Which?", vec!["a".into(), "b".into()]);
+        assert_eq!(
+            format_answers(std::slice::from_ref(&single), &[Answer::Choice("a".into())]),
+            "The user answered: a"
+        );
+        assert_eq!(
+            format_answers(
+                std::slice::from_ref(&single),
+                &[Answer::Text("neither".into())]
+            ),
+            "The user answered: (own answer) neither"
+        );
+
+        let multi = Question {
+            question: "Which ones?".into(),
+            kind: QuestionKind::Multi,
+            options: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let text = Question {
+            question: "Why?".into(),
+            kind: QuestionKind::Text,
+            options: Vec::new(),
+        };
+        let answers = [
+            Answer::Choice("b".into()),
+            Answer::Choices {
+                picked: vec!["a".into(), "c".into()],
+                other: Some("d".into()),
+            },
+            Answer::Text("because".into()),
+        ];
+        assert_eq!(
+            format_answers(&[single, multi, text], &answers),
+            "The user answered:\n1. Which?\n   b\n2. Which ones?\n   a, c; other: \"d\"\n\
+             3. Why?\n   because"
+        );
     }
 
     #[test]

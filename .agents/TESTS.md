@@ -16,15 +16,17 @@ access, API keys or an installed CLI.
   JSONL parsing from inline fixtures; live model list handling.
 - **cradle-tools**: path guard (escapes, symlinks, `.git/`, ignored and secret files,
   protected files); file tools; command splitting, failure and timeout; tool call
-  parsing; invisible-character hygiene.
+  parsing (including `ask_user` question kinds and option limits); invisible-character
+  hygiene.
 - **cradle-mcp**: the server over a real local socket: initialize, list and call (routed
   to the channel); refusal without the token or with an `Origin`; unknown tools.
 - **cradle-core**: trust snapshot hash stability, diff and store round trip; mode
   resolution and clashes; reviewer verdict parsing (missing or garbled means unsure);
-  prompt assembly; session log write, list and resume.
+  prompt assembly; session log write, list and resume; `ask_user` answer formatting.
 - **cradle** (bin): slash command suggestions, model picker, markdown rendering, text
   wrapping, tool cards, and TUI behaviour driven by key events (Tab/Shift+Tab mode
-  cycling, input history, sidebar, approvals with requested changes, grouped tool calls).
+  cycling, input history, sidebar, approvals with requested changes, grouped tool calls,
+  multi-question stepping and dismissal).
 
 ## Integration tests
 
