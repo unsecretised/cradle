@@ -27,3 +27,6 @@ Implemented features, with details in `features/`.
 | [DOC_PROPOSALS](roadmap/FEATURE_DOC_PROPOSALS.md) | Batched `.agents/` proposals (approved per-write edits already exist) |
 | [SANDBOX](roadmap/FEATURE_SANDBOX.md) | Sandbox for `[commands]` |
 | [ACP_AGENT](roadmap/FEATURE_ACP_AGENT.md) | Later: run Cradle inside ACP editors |
+| [GLOBAL_MODES](roadmap/FEATURE_GLOBAL_MODES.md) | User-level custom modes in `~/.config/cradle/modes/`; out of the Tab cycle unless `cycle: true` |
+| [SESSION_RESUME](roadmap/FEATURE_SESSION_RESUME.md) | Record provider/model and CLI session ids so resumed sessions keep their context |
+| [MORE_PROVIDERS](roadmap/FEATURE_MORE_PROVIDERS.md) | Grok, OpenCode Go, Amp, Pi, Antigravity and a ranked list of other APIs and CLIs |
