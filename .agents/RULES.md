@@ -16,6 +16,15 @@ These rules apply to any agent working on this repository.
 - When a roadmap item is implemented, propose moving it from `roadmap/` to `features/` and
   updating `features.md`.
 
+## Workflow
+
+- Before starting work on a brand new task, explain why the planned changes belong in a
+  single commit. If they don't, say how to split them and ask the user which part to do
+  first.
+- Docs come before code: for every feature (new or changed), propose the update to its
+  `.agents/` doc (`roadmap/`, `features/`, `features.md`, ...) and get it approved before
+  making any code edits for that feature.
+
 ## Code
 
 - Match the existing style. `cargo fmt` and `cargo clippy -D warnings` must pass.
