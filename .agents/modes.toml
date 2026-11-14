@@ -4,7 +4,6 @@ build_mode = "modes/build_mode.md"
 clash_handler = "ask" # override | combine | ask
 
 [extra]
-debug_mode = "modes/debug_mode.md"
 
 # The only commands an agent may run. BUILD.md explains them.
 [commands]

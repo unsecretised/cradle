@@ -115,6 +115,14 @@ impl ModesTables {
                     message: format!("`{key}` belongs in [default], not [extra]"),
                 });
             }
+            // The built-in scaffold mode may create project config, so a project must not
+            // be able to define a mode with its name.
+            if matches!(key.as_str(), "scaffold_mode" | "scaffold") {
+                return Err(ConfigError::Invalid {
+                    path: source.to_owned(),
+                    message: format!("`{key}` is a built-in mode and cannot be redefined"),
+                });
+            }
             let (rel, access) = match entry {
                 ExtraMode::Path(rel) => (rel, ModeAccess::Read),
                 ExtraMode::Table(t) => (t.path, t.access),
@@ -268,6 +276,14 @@ mod tests {
                 .resolve(&dir, &dir)
                 .is_err()
         );
+        for key in ["scaffold_mode", "scaffold"] {
+            assert!(
+                parse(&format!("[extra]\n{key} = \"modes/plan.md\""))
+                    .resolve(&dir, &dir)
+                    .is_err(),
+                "`{key}` is reserved"
+            );
+        }
         assert!(toml::from_str::<ModesTables>("[default]\nclash_handler = \"merge\"").is_err());
         assert!(toml::from_str::<ModesTables>("[default]\nplanmode = \"x\"").is_err());
     }

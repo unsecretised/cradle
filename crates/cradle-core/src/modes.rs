@@ -10,6 +10,11 @@ use cradle_config::{ClashHandler, Mode, ModeAccess, Modes, split_front_matter};
 
 const BUILTIN_PLAN: &str = include_str!("../modes/plan.md");
 const BUILTIN_BUILD: &str = include_str!("../modes/build.md");
+const BUILTIN_SCAFFOLD: &str = include_str!("../prompts/scaffold.md");
+
+/// The built-in mode that sets up `.agents/`. Only in this mode may missing project config
+/// be created. Projects and global config cannot replace it.
+pub const SCAFFOLD_MODE: &str = "scaffold";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveMode {
@@ -154,6 +159,11 @@ impl ModeSet {
             };
             modes.push(mode);
         }
+        modes.push(ActiveMode::parse(
+            SCAFFOLD_MODE,
+            ModeAccess::Full,
+            BUILTIN_SCAFFOLD,
+        )?);
         for Mode { name, path, access } in project.map(|m| m.extra.as_slice()).unwrap_or(&[]) {
             modes.push(ActiveMode::parse(
                 name,
@@ -233,10 +243,19 @@ mod tests {
     #[test]
     fn builtins_without_project() {
         let set = ModeSet::resolve(None, None, ClashChoice::Override).unwrap();
-        assert_eq!(set.names().collect::<Vec<_>>(), ["plan", "build"]);
+        assert_eq!(
+            set.names().collect::<Vec<_>>(),
+            ["plan", "build", "scaffold"]
+        );
         assert_eq!(set.get("plan").unwrap().access, ModeAccess::Read);
         assert_eq!(set.get("build").unwrap().access, ModeAccess::Full);
-        assert_eq!(set.next_after("build").name, "plan");
+        let scaffold = set.get(SCAFFOLD_MODE).unwrap();
+        assert_eq!(
+            (scaffold.access, scaffold.file_edits),
+            (ModeAccess::Full, FileEdits::Ask)
+        );
+        assert_eq!(set.next_after("build").name, "scaffold");
+        assert_eq!(set.next_after("scaffold").name, "plan");
     }
 
     #[test]
@@ -257,6 +276,11 @@ mod tests {
         let prompt = &comb.get("plan").unwrap().prompt;
         assert!(prompt.starts_with("global plan") && prompt.ends_with("project plan"));
         assert_eq!(comb.get("debug").unwrap().access, ModeAccess::Full);
+        assert_eq!(
+            comb.names().collect::<Vec<_>>(),
+            ["plan", "build", "scaffold", "debug"],
+            "extra modes come after the built-ins"
+        );
         assert_eq!(
             comb.get("build").unwrap().prompt,
             split_front_matter(BUILTIN_BUILD).1,

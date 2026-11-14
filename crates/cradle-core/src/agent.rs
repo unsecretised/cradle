@@ -25,13 +25,12 @@ use cradle_tools::{
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::modes::{FileEdits, ModeSet};
+use crate::modes::{FileEdits, ModeSet, SCAFFOLD_MODE};
 use crate::prompt;
 use crate::review::{self, ChangedFile, Verdict};
 use crate::session::SessionLog;
 
 const MAX_TOKENS: u32 = 64_000;
-const SCAFFOLD_PROMPT: &str = include_str!("../prompts/scaffold.md");
 const PREVIEW_LINES: usize = 4;
 
 /// Who approves `run_command`.
@@ -135,8 +134,6 @@ pub enum AgentCommand {
     SetReview(ReviewPolicy),
     ShowDiff,
     Clear,
-    /// Run a turn that sets up `.agents/` from what the project already has.
-    Scaffold,
     /// Continue a saved transcript instead of the current conversation.
     LoadSession(PathBuf),
     /// Switch model or provider. The conversation continues on the new model.
@@ -209,8 +206,6 @@ struct Agent {
     mcp: Option<(McpServer, mpsc::UnboundedReceiver<ToolRequest>)>,
     /// For CLI backends: the CLI's own session id, to continue the conversation.
     cli_session: Option<String>,
-    /// A `/scaffold` turn is running: missing project config may be created.
-    scaffolding: bool,
     /// The user allowed every file edit for the rest of the session.
     edits_allowed: bool,
     /// Parts that failed in the tool call that just ran, for its `ToolFinished`.
@@ -268,7 +263,6 @@ impl Agent {
             protected_changed: BTreeSet::new(),
             mcp: None,
             cli_session: None,
-            scaffolding: false,
             edits_allowed: false,
             failed_parts: Vec::new(),
             events,
@@ -298,22 +292,6 @@ impl Agent {
             match command {
                 AgentCommand::Send(text) => {
                     self.run_turn(text).await;
-                    self.emit(AgentEvent::TurnFinished);
-                }
-                AgentCommand::Scaffold => {
-                    let mode = self.modes.get(&self.mode).expect("current mode exists");
-                    if mode.effective_edits() == FileEdits::Deny {
-                        self.emit(AgentEvent::Notice(format!(
-                            "File edits are off in `{}` mode: switch to a mode that allows them \
-                             (Tab) and run /scaffold again.",
-                            mode.name
-                        )));
-                        self.emit(AgentEvent::TurnFinished);
-                        continue;
-                    }
-                    self.scaffolding = true;
-                    self.run_turn(SCAFFOLD_PROMPT.to_owned()).await;
-                    self.scaffolding = false;
                     self.emit(AgentEvent::TurnFinished);
                 }
                 AgentCommand::SetMode(name) => {
@@ -770,7 +748,9 @@ impl Agent {
                     .map_err(|_| ToolError::new("The question was dismissed."))
             }
             ToolCall::WriteFile { path, content } => {
-                let write = if self.scaffolding {
+                // Only the built-in scaffold mode may write project config; config
+                // loading rejects project modes with that name.
+                let write = if self.mode == SCAFFOLD_MODE {
                     tfs::prepare_scaffold_write(&self.guard, &path, &content)?
                 } else {
                     tfs::prepare_write(&self.guard, &path, &content)?
@@ -783,8 +763,17 @@ impl Agent {
                 new_string,
                 replace_all,
             } => {
-                let write =
-                    tfs::prepare_edit(&self.guard, &path, &old_string, &new_string, replace_all)?;
+                let write = if self.mode == SCAFFOLD_MODE {
+                    tfs::prepare_scaffold_edit(
+                        &self.guard,
+                        &path,
+                        &old_string,
+                        &new_string,
+                        replace_all,
+                    )?
+                } else {
+                    tfs::prepare_edit(&self.guard, &path, &old_string, &new_string, replace_all)?
+                };
                 self.apply_write(write).await
             }
             ToolCall::RunCommand { name, reason } => self.run_command(&name, &reason).await,

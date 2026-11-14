@@ -832,15 +832,7 @@ impl App {
             .map_or("", |(_, rest)| rest.trim());
         let idle_only = matches!(
             name,
-            "mode"
-                | "plan"
-                | "build"
-                | "clear"
-                | "diff"
-                | "model"
-                | "session"
-                | "scaffold"
-                | "skill"
+            "mode" | "plan" | "build" | "clear" | "diff" | "model" | "session" | "skill"
         );
         if idle_only && self.busy {
             self.note("Wait for the turn to finish (or Esc to cancel) first.");
@@ -878,12 +870,6 @@ impl App {
             ("skill", Some(skill)) => {
                 let request = rest.strip_prefix(skill).unwrap_or("").trim().to_owned();
                 self.use_skill(skill, &request, handle);
-            }
-            ("scaffold", _) => {
-                self.items.push(Item::User("/scaffold".into()));
-                self.scroll = 0;
-                self.busy = true;
-                send(handle, AgentCommand::Scaffold);
             }
             ("sidebar", _) => self.sidebar = !self.sidebar,
             ("clear", _) => {

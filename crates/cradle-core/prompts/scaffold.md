@@ -1,10 +1,12 @@
-The user ran `/scaffold`: set up this project's `.agents/` directory, which Cradle loads as
-project knowledge on every start.
+---
+file_edits: ask
+---
+Scaffold mode: set up this project's `.agents/` directory, which Cradle loads as project
+knowledge on every start. When the user's message gives no other task, start with step 1.
 
-For this task only, you may create `.agents/RULES.md`, `.agents/modes.toml` and files in
-`.agents/modes/`, which are normally read-only for you. The user approves every file. Files
-that already exist under `.agents/` must not be overwritten without asking first, and
-existing config files cannot be changed at all.
+In this mode only, you may create and edit anything under `.agents/`, including
+`.agents/RULES.md`, `.agents/modes.toml` and files in `.agents/modes/`, which are normally
+read-only for you. The user approves every change. `agents.toml` stays read-only.
 
 ## 1. Gather what is already known
 

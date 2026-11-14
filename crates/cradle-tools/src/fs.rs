@@ -226,7 +226,23 @@ pub fn prepare_write(
     path: &str,
     content: &str,
 ) -> Result<PreparedWrite, ToolError> {
-    let (target, class) = guard.resolve_write(path)?;
+    write_to(guard.resolve_write(path)?, content)
+}
+
+/// Like [`prepare_write`], but may also write anything under `.agents/`, project config
+/// included (for scaffold mode).
+pub fn prepare_scaffold_write(
+    guard: &PathGuard,
+    path: &str,
+    content: &str,
+) -> Result<PreparedWrite, ToolError> {
+    write_to(guard.resolve_scaffold(path)?, content)
+}
+
+fn write_to(
+    (target, class): (Resolved, WriteClass),
+    content: &str,
+) -> Result<PreparedWrite, ToolError> {
     if target.abs.is_dir() {
         return Err(ToolError::new(format!(
             "`{}` is a directory",
@@ -241,20 +257,6 @@ pub fn prepare_write(
     Ok(prepared(target, class, old.as_deref(), content.to_owned()))
 }
 
-/// Like [`prepare_write`], but may also create project config that does not exist yet
-/// (for `/scaffold`).
-pub fn prepare_scaffold_write(
-    guard: &PathGuard,
-    path: &str,
-    content: &str,
-) -> Result<PreparedWrite, ToolError> {
-    let (target, class) = guard.resolve_scaffold(path)?;
-    if class != WriteClass::AgentsConfig {
-        return prepare_write(guard, path, content);
-    }
-    Ok(prepared(target, class, None, content.to_owned()))
-}
-
 /// Prepare an exact-string replacement in an existing file.
 pub fn prepare_edit(
     guard: &PathGuard,
@@ -263,7 +265,37 @@ pub fn prepare_edit(
     new_string: &str,
     replace_all: bool,
 ) -> Result<PreparedWrite, ToolError> {
-    let (target, class) = guard.resolve_write(path)?;
+    edit_in(
+        guard.resolve_write(path)?,
+        old_string,
+        new_string,
+        replace_all,
+    )
+}
+
+/// Like [`prepare_edit`], but may also change anything under `.agents/`, project config
+/// included (for scaffold mode).
+pub fn prepare_scaffold_edit(
+    guard: &PathGuard,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<PreparedWrite, ToolError> {
+    edit_in(
+        guard.resolve_scaffold(path)?,
+        old_string,
+        new_string,
+        replace_all,
+    )
+}
+
+fn edit_in(
+    (target, class): (Resolved, WriteClass),
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<PreparedWrite, ToolError> {
     if !target.abs.is_file() {
         return Err(ToolError::new(format!(
             "`{}` does not exist; use write_file to create it",

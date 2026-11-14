@@ -79,12 +79,6 @@ pub const COMMANDS: &[CommandInfo] = &[
         needs_arg: false,
     },
     CommandInfo {
-        name: "scaffold",
-        args: "",
-        description: "set up .agents/ (from AGENTS.md if present)",
-        needs_arg: false,
-    },
-    CommandInfo {
         name: "quit",
         args: "",
         description: "exit cradle",

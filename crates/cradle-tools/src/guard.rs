@@ -5,7 +5,8 @@
 //! - Files matched by `.gitignore` (root file and `.git/info/exclude`) and common secret
 //!   files are hidden.
 //! - `.agents/` config (`RULES.md`, `modes.toml`, `modes/`) and `agents.toml` are
-//!   read-only. Other `.agents/` docs are writable only with user approval.
+//!   read-only, except that scaffold mode may write anything under `.agents/`. Other
+//!   `.agents/` docs are writable only with user approval.
 //! - Files that make other tools run code (build scripts, manifests, CI, editor tasks,
 //!   `.gitignore` itself) are writable only with user approval.
 
@@ -82,8 +83,8 @@ pub enum WriteClass {
     Protected(&'static str),
     /// A `.agents/` doc: needs user approval.
     AgentsDoc,
-    /// New project config (`.agents/RULES.md`, `modes.toml`, `modes/`), created by
-    /// `/scaffold`: needs user approval, and the project must be trusted again.
+    /// Project config (`.agents/RULES.md`, `modes.toml`, `modes/`), written in scaffold
+    /// mode: needs user approval, and the project must be trusted again.
     AgentsConfig,
 }
 
@@ -176,17 +177,20 @@ impl PathGuard {
         Ok((resolved, WriteClass::Normal))
     }
 
-    /// Resolve a path for creating project config during `/scaffold`. Only files that do
-    /// not exist yet; everything else is classified as by [`PathGuard::resolve_write`].
+    /// Resolve a path for writing in scaffold mode: anything under `.agents/` may be
+    /// created or changed, config included. `agents.toml` stays read-only; everything else
+    /// is classified as by [`PathGuard::resolve_write`].
     pub fn resolve_scaffold(&self, input: &str) -> Result<(Resolved, WriteClass), GuardError> {
         let resolved = self.resolve(input)?;
-        if !is_agents_config(&resolved.rel) {
+        if !resolved.rel.starts_with(".agents") {
             return self.resolve_write(input);
         }
-        if resolved.rel == Path::new("agents.toml") || resolved.abs.exists() {
-            return Err(GuardError::AgentsConfig(display(&resolved.rel)));
-        }
-        Ok((resolved, WriteClass::AgentsConfig))
+        let class = if is_agents_config(&resolved.rel) {
+            WriteClass::AgentsConfig
+        } else {
+            WriteClass::AgentsDoc
+        };
+        Ok((resolved, class))
     }
 
     /// Whether `rel` (relative to the root) is hidden by `.gitignore` or secret patterns.
@@ -371,6 +375,20 @@ mod tests {
             guard.resolve_scaffold(".agents/RULES.md").unwrap().1,
             WriteClass::AgentsConfig,
             "scaffolding may create config"
+        );
+        fs::write(guard.root().join(".agents/modes.toml"), "").unwrap();
+        assert_eq!(
+            guard.resolve_scaffold(".agents/modes.toml").unwrap().1,
+            WriteClass::AgentsConfig,
+            "scaffolding may change existing config"
+        );
+        assert_eq!(
+            guard.resolve_scaffold(".agents/features.md").unwrap().1,
+            WriteClass::AgentsDoc
+        );
+        assert_eq!(
+            guard.resolve_scaffold("src/lib.rs").unwrap().1,
+            WriteClass::Normal
         );
         assert!(matches!(
             guard.resolve_scaffold("agents.toml"),
