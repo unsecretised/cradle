@@ -2,6 +2,7 @@
 //! (`~/.config/cradle/modes/<name>.md`) and the project's modes. See
 //! `.agents/roadmap/FEATURE_MODES.md`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,10 @@ pub struct ActiveMode {
     pub file_edits: FileEdits,
     /// The instructions, without front matter.
     pub prompt: String,
+    /// This mode's own commands (`[<name>_mode.commands]`), by name. Only project config
+    /// sets these. They skip approval once the mode reviewer passes them, and they are the
+    /// only commands a read-only mode may run.
+    pub commands: BTreeMap<String, String>,
 }
 
 /// Whether the agent may create and change files in a mode.
@@ -66,6 +71,7 @@ impl ActiveMode {
             access,
             file_edits,
             prompt: body.to_owned(),
+            commands: BTreeMap::new(),
         })
     }
 
@@ -171,7 +177,23 @@ impl ModeSet {
                 &fs::read_to_string(path)?,
             )?);
         }
+        // Whichever prompt won the clash, mode commands come from the project only.
+        if let Some(project) = project {
+            for mode in &mut modes {
+                if mode.name == SCAFFOLD_MODE {
+                    continue;
+                }
+                if let Some(commands) = project.commands.get(&mode.name) {
+                    mode.commands = commands.clone();
+                }
+            }
+        }
         Ok(ModeSet { modes })
+    }
+
+    /// Every mode, in cycling order.
+    pub fn iter(&self) -> impl Iterator<Item = &ActiveMode> {
+        self.modes.iter()
     }
 
     /// Default modes the project and the user's global config both define.
@@ -237,6 +259,10 @@ mod tests {
                 path: dir.join("p_debug.md"),
                 access: ModeAccess::Full,
             }],
+            commands: BTreeMap::from([(
+                "plan".to_owned(),
+                BTreeMap::from([("check".to_owned(), "cargo check".to_owned())]),
+            )]),
         }
     }
 
@@ -288,6 +314,10 @@ mod tests {
         );
         assert_eq!(comb.get("build").unwrap().file_edits, FileEdits::Ask);
         assert_eq!(comb.get("plan").unwrap().effective_edits(), FileEdits::Deny);
+        for set in [&over, &comb] {
+            assert_eq!(set.get("plan").unwrap().commands["check"], "cargo check");
+            assert!(set.get("build").unwrap().commands.is_empty());
+        }
     }
 
     #[test]

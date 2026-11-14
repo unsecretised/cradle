@@ -19,6 +19,9 @@
 //!
 //! [commands]
 //! test = "cargo test"
+//!
+//! [build_mode.commands]              # run without approval in build mode, once reviewed
+//! check = "cargo check"
 //! ```
 
 use std::collections::BTreeMap;
@@ -28,13 +31,14 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::modes::{DefaultModes, ExtraMode, ModesTables};
+use crate::modes::{DefaultModes, ExtraMode, ModeTable, ModesTables};
 use crate::{
     AGENTS_DIR, AGENTS_TOML, ConfigError, Docs, Entry, EntryBody, ProjectConfig, SourceKind,
 };
 
+/// Unknown top-level tables land in `mode_tables`, where `ModesTables::resolve` rejects
+/// any that do not name a mode.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AgentsToml {
     #[serde(default)]
     docs: TomlDocs,
@@ -52,6 +56,8 @@ struct AgentsToml {
     extra: BTreeMap<String, ExtraMode>,
     #[serde(default)]
     commands: BTreeMap<String, String>,
+    #[serde(flatten)]
+    mode_tables: BTreeMap<String, ModeTable>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -76,6 +82,7 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
         default: parsed.default,
         extra: parsed.extra,
         commands: parsed.commands,
+        mode_tables: parsed.mode_tables,
     };
     let (modes, commands) = tables.resolve(&root.join(AGENTS_DIR), &path)?;
 
@@ -176,6 +183,9 @@ mod tests {
 
             [commands]
             test = "cargo test"
+
+            [plan_mode.commands]
+            check = "cargo check"
             "#,
         )
         .unwrap();
@@ -200,6 +210,7 @@ mod tests {
         assert_eq!(config.modes.plan.as_ref().unwrap().name, "plan");
         assert_eq!(config.modes.clash_handler, crate::ClashHandler::Combine);
         assert_eq!(config.commands["test"], "cargo test");
+        assert_eq!(config.modes.commands["plan"]["check"], "cargo check");
     }
 
     #[test]
@@ -207,5 +218,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("agents.toml"), "[featurs]\na = \"b\"").unwrap();
         assert!(matches!(load(tmp.path()), Err(ConfigError::Toml { .. })));
+        fs::write(tmp.path().join("agents.toml"), "[featurs]").unwrap();
+        assert!(matches!(load(tmp.path()), Err(ConfigError::Invalid { .. })));
     }
 }

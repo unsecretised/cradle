@@ -1,7 +1,8 @@
 //! System prompt and mode announcements.
 //!
-//! The system prompt is built once per session and never changes, so the prompt cache
-//! stays warm. Mode changes are announced with mid-conversation system messages instead.
+//! The system prompt is built once per session and changes only when the project config
+//! is reloaded, so the prompt cache stays warm. Mode changes are announced with
+//! mid-conversation system messages instead.
 
 use std::fmt::Write;
 use std::path::Path;
@@ -131,15 +132,23 @@ pub fn system_prompt(root: &Path, project: Option<&ProjectConfig>) -> String {
 /// The system message sent when a mode becomes active.
 pub fn mode_message(mode: &ActiveMode, tools: &[ToolDefinition]) -> String {
     let edits = mode.effective_edits();
+    let has_commands = !mode.commands.is_empty();
     let allowed: Vec<&str> = tools
         .iter()
         .filter(|t| match t.name {
             "write_file" | "edit_file" => edits != FileEdits::Deny,
+            "run_command" if has_commands => true,
             _ => mode.access == ModeAccess::Full || t.access == Access::Read,
         })
         .map(|t| t.name)
         .collect();
     let rule = match (mode.access, edits) {
+        (ModeAccess::Read, _) if has_commands => {
+            "This mode is read-only: you cannot write files, and you may run only this \
+             mode's own commands (listed below). The harness will refuse anything else. If \
+             the task needs changes, finish your plan and ask the user to switch to build \
+             mode (Shift+Tab)."
+        }
         (ModeAccess::Read, _) => {
             "This mode is read-only: you cannot write files or run commands, and the harness \
              will refuse if you try. If the task needs changes, finish your plan and ask the \
@@ -157,8 +166,18 @@ pub fn mode_message(mode: &ActiveMode, tools: &[ToolDefinition]) -> String {
             "You may change files and run configured commands, subject to approvals."
         }
     };
+    let commands = if has_commands {
+        let names: Vec<String> = mode.commands.keys().map(|n| format!("`{n}`")).collect();
+        format!(
+            "\nThis mode's own commands: {}. Once a reviewer has checked them they may run \
+             without asking the user; any the reviewer rejects are blocked for this session.",
+            names.join(", ")
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Mode is now `{}`. Tools available: {}.\n{rule}\n\n<mode_instructions>\n{}\n</mode_instructions>",
+        "Mode is now `{}`. Tools available: {}.\n{rule}{commands}\n\n<mode_instructions>\n{}\n</mode_instructions>",
         mode.name,
         allowed.join(", "),
         mode.prompt.trim()
@@ -179,6 +198,18 @@ mod tests {
         assert!(msg.contains("read_file") && msg.contains("ask_user"));
         assert!(!msg.contains("write_file") && !msg.contains("run_command,"));
         assert!(msg.contains("read-only"));
+    }
+
+    #[test]
+    fn read_only_mode_with_commands_may_run_them() {
+        let tools = cradle_tools::definitions(&[("fmt", "cargo fmt --check")]);
+        let mut mode = ActiveMode::parse("plan", ModeAccess::Read, "Plan it.").unwrap();
+        mode.commands
+            .insert("fmt".into(), "cargo fmt --check".into());
+        let msg = mode_message(&mode, &tools);
+        assert!(msg.contains("run_command"), "{msg}");
+        assert!(!msg.contains("write_file"), "{msg}");
+        assert!(msg.contains("only this mode's own commands") && msg.contains("`fmt`"));
     }
 
     #[test]

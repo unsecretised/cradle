@@ -6,17 +6,22 @@
 //! - Every `run_command` is approved by the user, or by the reviewer subagent when that
 //!   policy is on. The reviewer is skipped (the user decides) once any protected file has
 //!   changed this session.
+//! - A mode's own commands (`[<name>_mode.commands]`) are reviewed on the first message in
+//!   that mode, under the reviewer policy. Safe ones run without asking; the rest are
+//!   blocked for the session, by command line. Read-only modes may run only these.
+//! - Project config is reloaded before every message. A changed config applies only once
+//!   the user trusts it, after seeing the diff.
 //! - History is append-only, which the API's thinking blocks require.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cradle_backends::{
     AgentTurn, Backend, Block, McpEndpoint, Message, ModelRequest, Role, StopReason, StreamEvent,
     ToolSpec, Usage,
 };
-use cradle_config::{ModeAccess, ProjectConfig};
+use cradle_config::{Detection, ModeAccess, ProjectConfig, SourceKind};
 use cradle_mcp::{McpServer, McpTool, ToolReply, ToolRequest};
 use cradle_tools::hygiene::reveal_invisible;
 use cradle_tools::{
@@ -25,10 +30,11 @@ use cradle_tools::{
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::modes::{FileEdits, ModeSet, SCAFFOLD_MODE};
+use crate::modes::{ClashChoice, FileEdits, ModeSet, SCAFFOLD_MODE};
 use crate::prompt;
 use crate::review::{self, ChangedFile, Verdict};
 use crate::session::SessionLog;
+use crate::trust::{self, TrustStore};
 
 const MAX_TOKENS: u32 = 64_000;
 const PREVIEW_LINES: usize = 4;
@@ -75,6 +81,9 @@ pub enum AgentEvent {
         name: String,
         read_only: bool,
     },
+    /// The available modes changed (the project config was reloaded): each name and
+    /// whether it is read-only.
+    ModesChanged(Vec<(String, bool)>),
     ModelChanged {
         provider: String,
         model: String,
@@ -153,6 +162,11 @@ pub struct AgentSetup {
     pub session: Option<SessionLog>,
     /// Where `/clear` starts a new transcript.
     pub data_dir: Option<PathBuf>,
+    /// `trust.toml`, for approving a changed project config mid-session. `None`: approvals
+    /// last only for this session.
+    pub trust_store: Option<PathBuf>,
+    /// The user's global modes (`~/.config/cradle/modes/`), for re-resolving modes.
+    pub global_modes: Option<PathBuf>,
 }
 
 pub struct AgentHandle {
@@ -196,8 +210,26 @@ struct Agent {
     session: Option<SessionLog>,
     data_dir: Option<PathBuf>,
     usage: Usage,
-    /// Commands the user allowed for the rest of the session.
+    /// The applied project config (`None`: absent or not trusted).
+    project: Option<ProjectConfig>,
+    /// The snapshot and hash of `project`, to notice and show changes.
+    applied: Option<(String, String)>,
+    /// A changed config the user declined this session, by hash: not asked about again.
+    declined_hash: Option<String>,
+    /// The last config load error shown, so it is not repeated every message.
+    config_error: Option<String>,
+    trust_store: Option<PathBuf>,
+    global_modes: Option<PathBuf>,
+    /// Command lines the user allowed for the rest of the session.
     always_allowed: HashSet<String>,
+    /// Mode command lines the mode reviewer judged safe this session.
+    mode_safe: HashSet<String>,
+    /// Mode command lines the mode reviewer did not pass, with its reason. Blocked for the
+    /// session wherever they are configured.
+    blocked: BTreeMap<String, String>,
+    /// Each mode's commands as last reviewed, so a mode is reviewed once per session (and
+    /// again only if its commands change).
+    reviewed_modes: HashMap<String, BTreeMap<String, String>>,
     /// Content of each changed file before its first change this session (`None`: new).
     originals: BTreeMap<String, (PathBuf, Option<String>)>,
     /// Protected files changed since the user last approved a command.
@@ -225,20 +257,27 @@ impl Agent {
             .as_ref()
             .map(|p| p.commands.clone())
             .unwrap_or_default();
-        let command_list: Vec<(&str, &str)> = commands
-            .iter()
-            .map(|(n, l)| (n.as_str(), l.as_str()))
-            .collect();
-        let tools = cradle_tools::definitions(&command_list);
-        let tool_specs = tools
-            .iter()
-            .map(|t| ToolSpec {
-                name: t.name.to_owned(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
-            .collect();
+        let (tools, tool_specs) = tool_set(setup.project.as_ref());
         let system = prompt::system_prompt(setup.guard.root(), setup.project.as_ref());
+
+        let applied = setup.project.as_ref().and_then(|p| {
+            let snapshot = trust::snapshot(p).ok()?;
+            Some((trust::snapshot_hash(&snapshot), snapshot))
+        });
+        // Without a trusted project, any config on disk was declined at startup (or there
+        // is none). Don't ask about it again until it changes.
+        let declined_hash = if setup.project.is_none() {
+            let store = setup
+                .trust_store
+                .as_ref()
+                .and_then(|p| TrustStore::load(p.clone()).ok());
+            load_project(setup.guard.root(), store.as_ref(), None)
+                .ok()
+                .flatten()
+                .and_then(|p| trust::fingerprint(&p).ok())
+        } else {
+            None
+        };
 
         let mut history = setup.history;
         close_dangling_tool_calls(&mut history);
@@ -258,7 +297,16 @@ impl Agent {
             session: setup.session,
             data_dir: setup.data_dir,
             usage: Usage::default(),
+            project: setup.project,
+            applied,
+            declined_hash,
+            config_error: None,
+            trust_store: setup.trust_store,
+            global_modes: setup.global_modes,
             always_allowed: HashSet::new(),
+            mode_safe: HashSet::new(),
+            blocked: BTreeMap::new(),
+            reviewed_modes: HashMap::new(),
             originals: BTreeMap::new(),
             protected_changed: BTreeSet::new(),
             mcp: None,
@@ -358,6 +406,7 @@ impl Agent {
                     self.history.clear();
                     self.announced_mode = None;
                     self.cli_session = None;
+                    self.reset_mode_reviews();
                     if let (Some(dir), Some(_)) = (&self.data_dir, &self.session) {
                         self.session = SessionLog::create(dir, self.guard.root()).ok();
                     }
@@ -376,6 +425,7 @@ impl Agent {
                         self.history = history;
                         self.announced_mode = None;
                         self.cli_session = None;
+                        self.reset_mode_reviews();
                         self.emit(AgentEvent::SessionLoaded(self.history.clone()));
                         if self.backend.is_cli() {
                             self.emit(AgentEvent::Notice(format!(
@@ -413,6 +463,301 @@ impl Agent {
                 "cannot start Cradle's tool server: {e}"
             ))),
         }
+    }
+
+    /// Reload the project config from disk. An unchanged config does nothing. A changed
+    /// one applies at once if the user already trusts it; otherwise the user sees the diff
+    /// and decides. Returns `false` if the user cancelled the turn while deciding.
+    async fn reload_config(&mut self) -> bool {
+        let root = self.guard.root().to_path_buf();
+        let mut store = self
+            .trust_store
+            .as_ref()
+            .and_then(|p| TrustStore::load(p.clone()).ok());
+
+        let current_source = self.project.as_ref().map(|p| p.source);
+        let project = match load_project(&root, store.as_ref(), current_source) {
+            Ok(project) => {
+                self.config_error = None;
+                project
+            }
+            Err(e) => {
+                if self.config_error.as_deref() != Some(e.as_str()) {
+                    self.emit(AgentEvent::Error(format!(
+                        "The project config has an error; keeping the previous config: {e}"
+                    )));
+                    self.config_error = Some(e);
+                }
+                return true;
+            }
+        };
+
+        let Some(project) = project else {
+            // Removing the config only takes permissions away: apply without asking.
+            if self.project.is_some() {
+                self.apply_config(None, None, &mut store).await;
+                self.emit(AgentEvent::Notice(
+                    "The project config was removed: running without project modes and commands."
+                        .into(),
+                ));
+            }
+            return true;
+        };
+        let snapshot = match trust::snapshot(&project) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.emit(AgentEvent::Error(format!(
+                    "cannot read the project config: {e}"
+                )));
+                return true;
+            }
+        };
+        let hash = trust::snapshot_hash(&snapshot);
+
+        if self.applied.as_ref().is_some_and(|(h, _)| *h == hash) {
+            // Nothing trusted changed. Docs (product.md, architecture.md, ...) may have.
+            if self.project.as_ref() != Some(&project) {
+                self.apply_config(Some(project), Some((hash, snapshot)), &mut store)
+                    .await;
+            }
+            return true;
+        }
+        if store.as_ref().is_some_and(|s| s.is_trusted(&root, &hash)) {
+            self.apply_config(Some(project), Some((hash, snapshot)), &mut store)
+                .await;
+            self.emit(AgentEvent::Notice(
+                "The project config changed to a version you already trust; applied it.".into(),
+            ));
+            return true;
+        }
+        if self.declined_hash.as_deref() == Some(hash.as_str()) {
+            return true;
+        }
+
+        // Diff against what the user last approved: the stored snapshot, else the one
+        // running now.
+        let approved = store
+            .as_ref()
+            .and_then(|s| s.approved_snapshot(&root))
+            .or_else(|| self.applied.as_ref().map(|(_, s)| s.clone()));
+        let title = if approved.is_some() {
+            "The project config changed. Trust and apply it?"
+        } else {
+            "Trust this project config and apply it?"
+        };
+        let diff = trust::config_diff(approved.as_deref(), &snapshot);
+        let note = Some(
+            "Approve to apply it now. Decline to keep the current config for this session \
+             (Cradle asks again if it changes)."
+                .to_owned(),
+        );
+        let cancel = self.cancel.clone();
+        let answer = tokio::select! {
+            answer = self.ask(title.to_owned(), diff, note, None) => answer,
+            _ = cancel.notified() => return false,
+        };
+        match answer {
+            Approval::Yes | Approval::Always => {
+                if let Some(store) = store.as_mut()
+                    && let Err(e) = store.trust(&root, &snapshot)
+                {
+                    self.emit(AgentEvent::Error(format!(
+                        "cannot save the approval (it applies to this session only): {e}"
+                    )));
+                }
+                self.apply_config(Some(project), Some((hash, snapshot)), &mut store)
+                    .await;
+                self.emit(AgentEvent::Notice("Applied the new project config.".into()));
+            }
+            Approval::No | Approval::Change(_) => {
+                self.declined_hash = Some(hash);
+                self.emit(AgentEvent::Notice(
+                    "Kept the current project config.".into(),
+                ));
+            }
+        }
+        true
+    }
+
+    /// Switch to a new (trusted) project config: commands, tools, system prompt and modes.
+    async fn apply_config(
+        &mut self,
+        project: Option<ProjectConfig>,
+        applied: Option<(String, String)>,
+        store: &mut Option<TrustStore>,
+    ) {
+        let choice = self.clash_choice(project.as_ref(), store).await;
+        let modes = match ModeSet::resolve(
+            project.as_ref().map(|p| &p.modes),
+            self.global_modes.as_deref(),
+            choice,
+        ) {
+            Ok(modes) => modes,
+            Err(e) => {
+                self.emit(AgentEvent::Error(format!(
+                    "cannot read mode files; keeping the previous config: {e}"
+                )));
+                return;
+            }
+        };
+
+        let (tools, tool_specs) = tool_set(project.as_ref());
+        let tools_changed =
+            self.tools.len() != tools.len()
+                || self.tools.iter().zip(&tools).any(|(a, b)| {
+                    a.description != b.description || a.input_schema != b.input_schema
+                });
+        self.tools = tools;
+        self.tool_specs = tool_specs;
+        self.system = prompt::system_prompt(self.guard.root(), project.as_ref());
+        self.commands = project
+            .as_ref()
+            .map(|p| p.commands.clone())
+            .unwrap_or_default();
+        self.modes = modes;
+        if self.modes.get(&self.mode).is_none() {
+            self.emit(AgentEvent::Notice(format!(
+                "Mode `{}` no longer exists; switched to build.",
+                self.mode
+            )));
+            self.mode = "build".to_owned();
+        }
+        // The mode's instructions or commands may have changed: tell the model again.
+        self.announced_mode = None;
+        self.project = project;
+        self.applied = applied;
+        self.declined_hash = None;
+
+        let modes = self
+            .modes
+            .iter()
+            .map(|m| (m.name.clone(), m.access == ModeAccess::Read))
+            .collect();
+        self.emit(AgentEvent::ModesChanged(modes));
+        self.emit_mode();
+
+        // A CLI backend got Cradle's tools when its tool server started.
+        if tools_changed && self.mcp.is_some() {
+            self.mcp = None;
+            self.start_mcp().await;
+            if self.cli_session.take().is_some() {
+                self.emit(AgentEvent::Notice(format!(
+                    "{} starts a fresh session: Cradle's tools changed with the config.",
+                    self.backend.provider()
+                )));
+            }
+        }
+    }
+
+    /// How to combine project and global modes: the project's `clash_handler`, else the
+    /// stored choice, else ask the user (and store the answer).
+    async fn clash_choice(
+        &self,
+        project: Option<&ProjectConfig>,
+        store: &mut Option<TrustStore>,
+    ) -> ClashChoice {
+        let modes = project.map(|p| &p.modes);
+        if let Some(choice) = modes.and_then(|m| ClashChoice::from_handler(m.clash_handler)) {
+            return choice;
+        }
+        let clashes = ModeSet::clashes(modes, self.global_modes.as_deref());
+        if clashes.is_empty() {
+            return ClashChoice::Override;
+        }
+        let root = self.guard.root();
+        if let Some(choice) = store.as_ref().and_then(|s| s.clash_choice(root)) {
+            return choice;
+        }
+        let names: Vec<&str> = clashes.iter().map(|c| c.mode.as_str()).collect();
+        let (override_label, combine_label) = (
+            "Use the project's version (override)",
+            "Use both: global first, then the project's (combine)",
+        );
+        let (reply, answer) = oneshot::channel();
+        self.emit(AgentEvent::Question(QuestionRequest {
+            question: format!(
+                "Both your global config and this project define these modes: {}. Which \
+                 should apply?",
+                names.join(", ")
+            ),
+            options: vec![override_label.to_owned(), combine_label.to_owned()],
+            reply,
+        }));
+        let choice = match answer.await.as_deref() {
+            Ok(a) if a == combine_label => ClashChoice::Combine,
+            _ => ClashChoice::Override,
+        };
+        if let Some(store) = store.as_mut() {
+            let _ = store.set_clash_choice(root, choice);
+        }
+        choice
+    }
+
+    /// On the first message in a mode, have the reviewer check the mode's own commands.
+    /// Safe ones may then run without approval; the rest are blocked for the session.
+    /// Only under the reviewer policy. Returns `false` if the user cancelled.
+    async fn review_mode(&mut self) -> bool {
+        if self.review != ReviewPolicy::Subagent {
+            return true;
+        }
+        let mode = self.modes.get(&self.mode).expect("current mode exists");
+        if mode.commands.is_empty() || self.reviewed_modes.get(&mode.name) == Some(&mode.commands) {
+            return true;
+        }
+        let name = mode.name.clone();
+        let all = mode.commands.clone();
+        // Lines already judged this session (in another mode, or before a reload) keep
+        // their verdict.
+        let pending: BTreeMap<String, String> = all
+            .iter()
+            .filter(|(_, line)| {
+                !self.mode_safe.contains(*line) && !self.blocked.contains_key(*line)
+            })
+            .map(|(n, l)| (n.clone(), l.clone()))
+            .collect();
+
+        if !pending.is_empty() {
+            self.emit(AgentEvent::Notice(format!(
+                "Reviewer is checking the `{name}` mode's commands…"
+            )));
+            let backend = self.backend.clone();
+            let cancel = self.cancel.clone();
+            let reviews = tokio::select! {
+                reviews = review::review_mode_commands(&backend, &name, &pending) => reviews,
+                _ = cancel.notified() => return false,
+            };
+            for (command, review) in reviews {
+                let line = pending[&command].clone();
+                self.emit(AgentEvent::ReviewResult {
+                    command: format!("{command} ({name} mode)"),
+                    verdict: review.verdict,
+                    reason: review.reason.clone(),
+                });
+                if review.verdict == Verdict::Safe {
+                    self.mode_safe.insert(line);
+                } else {
+                    self.emit(AgentEvent::Notice(format!(
+                        "Blocked `{command}` (`{line}`) for this session: the reviewer did not \
+                         judge it safe."
+                    )));
+                    let reason = if review.reason.is_empty() {
+                        "no reason given".to_owned()
+                    } else {
+                        review.reason
+                    };
+                    self.blocked.insert(line, reason);
+                }
+            }
+        }
+        self.reviewed_modes.insert(name, all);
+        true
+    }
+
+    /// A new session: mode commands are reviewed again and blocks are lifted.
+    fn reset_mode_reviews(&mut self) {
+        self.mode_safe.clear();
+        self.blocked.clear();
+        self.reviewed_modes.clear();
     }
 
     /// Announce the current mode if the model has not seen it yet. Returns the message.
@@ -524,6 +869,10 @@ impl Agent {
     }
 
     async fn run_turn(&mut self, text: String) {
+        if !self.reload_config().await || !self.review_mode().await {
+            self.emit(AgentEvent::Notice("Cancelled.".into()));
+            return;
+        }
         if self.backend.is_cli() {
             return self.run_cli_turn(text).await;
         }
@@ -689,10 +1038,21 @@ impl Agent {
                 true,
             );
         }
-        if call.access() == Access::Write && mode.access == ModeAccess::Read {
+        // Read-only modes may run their own commands, and nothing else that writes.
+        let own_command = matches!(
+            &call,
+            ToolCall::RunCommand { name, .. } if mode.commands.contains_key(name)
+        );
+        if call.access() == Access::Write && mode.access == ModeAccess::Read && !own_command {
+            let also = if mode.commands.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<&str> = mode.commands.keys().map(String::as_str).collect();
+                format!(" Its own commands are available: {}.", names.join(", "))
+            };
             return (
                 format!(
-                    "`{name}` is not available in `{}` mode, which is read-only. Finish \
+                    "`{name}` is not available in `{}` mode, which is read-only.{also} Finish \
                      planning and ask the user to switch to build mode.",
                     mode.name
                 ),
@@ -791,7 +1151,7 @@ impl Agent {
             WriteClass::AgentsDoc => Some("Project documentation in .agents/.".to_owned()),
             WriteClass::AgentsConfig => Some(
                 "Project config: it decides which commands and modes the agent gets. Cradle \
-                 asks you to trust it on the next start."
+                 asks you to trust the change before your next message."
                     .to_owned(),
             ),
         };
@@ -854,21 +1214,48 @@ impl Agent {
     }
 
     async fn run_command(&mut self, name: &str, reason: &str) -> Result<String, ToolError> {
-        let Some(line) = self.commands.get(name).cloned() else {
-            let names: Vec<&str> = self.commands.keys().map(String::as_str).collect();
-            return Err(ToolError::new(format!(
-                "unknown command `{name}`; configured: {}",
-                if names.is_empty() {
-                    "none".into()
-                } else {
-                    names.join(", ")
+        let mode = self.modes.get(&self.mode).expect("current mode exists");
+        let mode_line = mode.commands.get(name).cloned();
+        let read_only = mode.access == ModeAccess::Read;
+        // The mode's own definition wins; read-only modes have nothing else.
+        let line = match &mode_line {
+            Some(line) => line.clone(),
+            None => match self.commands.get(name) {
+                Some(line) if !read_only => line.clone(),
+                _ => {
+                    let mut names: BTreeSet<&str> =
+                        mode.commands.keys().map(String::as_str).collect();
+                    if !read_only {
+                        names.extend(self.commands.keys().map(String::as_str));
+                    }
+                    let names: Vec<&str> = names.into_iter().collect();
+                    return Err(ToolError::new(format!(
+                        "command `{name}` is not available in `{}` mode; available: {}",
+                        mode.name,
+                        if names.is_empty() {
+                            "none".into()
+                        } else {
+                            names.join(", ")
+                        }
+                    )));
                 }
-            )));
+            },
         };
+        // A line the mode reviewer did not pass is blocked wherever it is configured.
+        if let Some(why) = self.blocked.get(&line) {
+            return Err(ToolError::new(format!(
+                "`{name}` is blocked for this session: the reviewer did not judge `{line}` \
+                 safe ({why}). Do not retry; tell the user."
+            )));
+        }
         let argv = command::split(&line)?;
         let reason = reveal_invisible(reason).into_owned();
 
-        let pre_approved = self.always_allowed.contains(name) && self.protected_changed.is_empty();
+        let reviewed_safe = mode_line.is_some()
+            && self.review == ReviewPolicy::Subagent
+            && self.mode_safe.contains(&line);
+        let pre_approved = (self.always_allowed.contains(&line) || reviewed_safe)
+            && self.protected_changed.is_empty();
         if !pre_approved {
             let protected_note = (!self.protected_changed.is_empty()).then(|| {
                 let files: Vec<&str> = self.protected_changed.iter().map(String::as_str).collect();
@@ -916,7 +1303,7 @@ impl Agent {
                     }
                     Approval::Always => {
                         self.protected_changed.clear();
-                        self.always_allowed.insert(name.to_owned());
+                        self.always_allowed.insert(line.clone());
                     }
                     Approval::No => {
                         return Err(ToolError::new(format!(
@@ -1007,6 +1394,64 @@ impl Agent {
             read_only: mode.access == ModeAccess::Read,
         });
     }
+}
+
+/// The tool definitions for a project. `run_command` lists `[commands]` and every mode's
+/// own commands; which of them may run in the current mode is enforced per call.
+fn tool_set(project: Option<&ProjectConfig>) -> (Vec<ToolDefinition>, Vec<ToolSpec>) {
+    let mut listed: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    if let Some(project) = project {
+        for (name, line) in &project.commands {
+            listed.entry(name).or_default().push(line.clone());
+        }
+        for (mode, commands) in &project.modes.commands {
+            for (name, line) in commands {
+                listed
+                    .entry(name)
+                    .or_default()
+                    .push(format!("{line} (`{mode}` mode command)"));
+            }
+        }
+    }
+    let lines: Vec<(&str, String)> = listed
+        .into_iter()
+        .map(|(name, lines)| (name, lines.join("; ")))
+        .collect();
+    let pairs: Vec<(&str, &str)> = lines.iter().map(|(n, l)| (*n, l.as_str())).collect();
+    let tools = cradle_tools::definitions(&pairs);
+    let specs = tools
+        .iter()
+        .map(|t| ToolSpec {
+            name: t.name.to_owned(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
+    (tools, specs)
+}
+
+/// Load the project config as it is on disk now. When both forms exist, use the stored
+/// choice, else the form in use. `Ok(None)`: there is no project config.
+fn load_project(
+    root: &Path,
+    store: Option<&TrustStore>,
+    current: Option<SourceKind>,
+) -> Result<Option<ProjectConfig>, String> {
+    let source = match cradle_config::detect(root).map_err(|e| e.to_string())? {
+        Detection::None => return Ok(None),
+        Detection::One(source) => source,
+        Detection::Both => match store.and_then(|s| s.source_choice(root)).or(current) {
+            Some(source) => source,
+            None => {
+                return Err(
+                    "both .agents/ and agents.toml exist; restart Cradle to choose one".into(),
+                );
+            }
+        },
+    };
+    cradle_config::load(root, source)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 fn tool_result(id: &str, content: String, is_error: bool) -> Block {

@@ -95,12 +95,41 @@ fn sse(events: &[Value]) -> String {
 }
 
 fn project(root: &Path) {
+    project_with(root, "[commands]\nmark = \"touch ran.txt\"\n");
+}
+
+fn project_with(root: &Path, modes_toml: &str) {
     fs::create_dir_all(root.join(".agents")).unwrap();
-    fs::write(
-        root.join(".agents/modes.toml"),
-        "[commands]\nmark = \"touch ran.txt\"\n",
-    )
-    .unwrap();
+    fs::write(root.join(".agents/modes.toml"), modes_toml).unwrap();
+}
+
+/// Run one turn, answering every approval with `approve`. Returns each approval's title
+/// and body.
+async fn turn_approvals(
+    handle: &mut AgentHandle,
+    prompt: &str,
+    approve: Approval,
+) -> Vec<(String, String)> {
+    handle
+        .commands
+        .send(AgentCommand::Send(prompt.into()))
+        .unwrap();
+    let mut asked = Vec::new();
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::Approval(req) => {
+                asked.push((req.title, req.body));
+                req.reply.send(approve.clone()).unwrap();
+            }
+            AgentEvent::TurnFinished => return asked,
+            _ => {}
+        }
+    }
+    panic!("agent stopped");
+}
+
+fn mode_review(verdicts: Value) -> String {
+    text(&json!({ "commands": verdicts }).to_string())
 }
 
 fn start(url: &str, root: &Path, mode: &str, review: ReviewPolicy) -> AgentHandle {
@@ -133,6 +162,8 @@ fn start(url: &str, root: &Path, mode: &str, review: ReviewPolicy) -> AgentHandl
         history: vec![],
         session: None,
         data_dir: None,
+        trust_store: None,
+        global_modes: None,
     })
 }
 
@@ -378,4 +409,256 @@ async fn requested_changes_reach_the_model() {
     assert!(!tmp.path().join("a.txt").exists());
     let (content, is_error) = tool_result(&requests, 1);
     assert!(is_error && content.contains("call it b.txt"), "{content}");
+}
+
+#[tokio::test]
+async fn reviewed_mode_command_runs_without_asking_and_is_reviewed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[build_mode.commands]\nmark = \"touch ran.txt\"\n",
+    );
+    let run_mark = || {
+        tool_call(
+            "t1",
+            "run_command",
+            json!({"name": "mark", "reason": "test"}),
+        )
+    };
+    let (url, requests) = fake_server(vec![
+        mode_review(json!({"mark": {"verdict": "safe", "reason": "touches a file"}})),
+        run_mark(),
+        text("done"),
+        run_mark(),
+        text("done"),
+        // After /clear: a new session, so a new review.
+        mode_review(json!({"mark": {"verdict": "safe", "reason": "touches a file"}})),
+        run_mark(),
+        text("done"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::Subagent);
+
+    assert!(!turn(&mut agent, "run it", Approval::No).await);
+    assert!(tmp.path().join("ran.txt").exists());
+    // The mode review is a fresh call that lists the mode's commands.
+    {
+        let requests = requests.lock().unwrap();
+        let review = &requests[0];
+        assert!(review.get("tools").is_none());
+        assert_eq!(review["messages"].as_array().unwrap().len(), 1);
+        assert!(review.to_string().contains("touch ran.txt"));
+    }
+
+    fs::remove_file(tmp.path().join("ran.txt")).unwrap();
+    assert!(!turn(&mut agent, "again", Approval::No).await);
+    assert!(tmp.path().join("ran.txt").exists());
+    assert_eq!(requests.lock().unwrap().len(), 5, "no second review");
+
+    agent.commands.send(AgentCommand::Clear).unwrap();
+    assert!(!turn(&mut agent, "after clear", Approval::No).await);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        8,
+        "reviewed again after /clear"
+    );
+}
+
+#[tokio::test]
+async fn rejected_mode_command_is_blocked_everywhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[commands]\nmark = \"touch ran.txt\"\n[build_mode.commands]\nmark = \"touch ran.txt\"\n",
+    );
+    let (url, requests) = fake_server(vec![
+        mode_review(json!({"mark": {"verdict": "unsure", "reason": "cannot tell"}})),
+        tool_call(
+            "t1",
+            "run_command",
+            json!({"name": "mark", "reason": "test"}),
+        ),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::Subagent);
+
+    let asked = turn(&mut agent, "run it", Approval::Yes).await;
+
+    assert!(!asked, "blocked commands are refused, not asked about");
+    assert!(!tmp.path().join("ran.txt").exists());
+    let (content, is_error) = tool_result(&requests, 2);
+    assert!(is_error && content.contains("blocked"), "{content}");
+}
+
+#[tokio::test]
+async fn user_policy_asks_for_mode_commands_without_a_review() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[build_mode.commands]\nmark = \"touch ran.txt\"\n",
+    );
+    let (url, requests) = fake_server(vec![
+        tool_call(
+            "t1",
+            "run_command",
+            json!({"name": "mark", "reason": "test"}),
+        ),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::User);
+
+    assert!(turn(&mut agent, "run it", Approval::Yes).await);
+    assert!(tmp.path().join("ran.txt").exists());
+    assert_eq!(requests.lock().unwrap().len(), 2, "no reviewer call");
+}
+
+#[tokio::test]
+async fn read_only_mode_runs_only_its_own_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[commands]\nother = \"touch other.txt\"\n[plan_mode.commands]\nmark = \"touch ran.txt\"\n",
+    );
+    let (url, requests) = fake_server(vec![
+        tool_call(
+            "t1",
+            "run_command",
+            json!({"name": "mark", "reason": "check"}),
+        ),
+        tool_call(
+            "t2",
+            "run_command",
+            json!({"name": "other", "reason": "check"}),
+        ),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "plan", ReviewPolicy::User);
+
+    turn(&mut agent, "go", Approval::Yes).await;
+
+    assert!(tmp.path().join("ran.txt").exists());
+    assert!(!tmp.path().join("other.txt").exists());
+    let (content, is_error) = tool_result(&requests, 2);
+    assert!(is_error && content.contains("read-only"), "{content}");
+}
+
+#[tokio::test]
+async fn protected_change_suspends_mode_auto_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[build_mode.commands]\nmark = \"touch ran.txt\"\n",
+    );
+    let (url, requests) = fake_server(vec![
+        mode_review(json!({"mark": {"verdict": "safe", "reason": "touches a file"}})),
+        tool_call(
+            "t1",
+            "write_file",
+            json!({"path": "build.rs", "content": "fn main() {}"}),
+        ),
+        tool_call(
+            "t2",
+            "run_command",
+            json!({"name": "mark", "reason": "build"}),
+        ),
+        text("done"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::Subagent);
+
+    let asked = turn_approvals(&mut agent, "go", Approval::Yes).await;
+
+    let titles: Vec<&str> = asked.iter().map(|(t, _)| t.as_str()).collect();
+    assert!(titles.iter().any(|t| t.contains("build.rs")), "{titles:?}");
+    assert!(titles.iter().any(|t| t.contains("mark")), "{titles:?}");
+    assert!(tmp.path().join("ran.txt").exists());
+    assert_eq!(requests.lock().unwrap().len(), 4, "no per-command review");
+}
+
+#[tokio::test]
+async fn changed_config_asks_with_a_diff_and_decline_keeps_the_old_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    let (url, requests) = fake_server(vec![
+        tool_call(
+            "t1",
+            "run_command",
+            json!({"name": "mark", "reason": "test"}),
+        ),
+        text("ok"),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::User);
+    project_with(tmp.path(), "[commands]\nmark = \"touch evil.txt\"\n");
+
+    let asked = turn_approvals(&mut agent, "run it", Approval::No).await;
+
+    let (title, body) = &asked[0];
+    assert!(title.contains("config changed"), "{title}");
+    assert!(body.contains("-mark = touch ran.txt"), "{body}");
+    assert!(body.contains("+mark = touch evil.txt"), "{body}");
+    // Declined: the command still means the old line (and was declined too).
+    assert!(asked[1].1.contains("$ touch ran.txt"), "{:?}", asked[1]);
+    assert!(!tmp.path().join("evil.txt").exists());
+
+    let asked = turn_approvals(&mut agent, "hello", Approval::No).await;
+    assert!(
+        asked.is_empty(),
+        "a declined version is not asked about again"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn approved_config_change_applies_before_the_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    let (url, requests) = fake_server(vec![
+        tool_call(
+            "t1",
+            "run_command",
+            json!({"name": "mark", "reason": "test"}),
+        ),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::User);
+    project_with(tmp.path(), "[commands]\nmark = \"touch new.txt\"\n");
+
+    let asked = turn_approvals(&mut agent, "run it", Approval::Yes).await;
+
+    assert_eq!(asked.len(), 2, "the config, then the command");
+    assert!(tmp.path().join("new.txt").exists());
+    assert!(!tmp.path().join("ran.txt").exists());
+    // The model was told about the new command.
+    let first = &requests.lock().unwrap()[0];
+    assert!(first.to_string().contains("touch new.txt"));
+}
+
+#[tokio::test]
+async fn unchanged_config_is_not_asked_about() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    fs::write(tmp.path().join(".agents/product.md"), "v1").unwrap();
+    let (url, requests) = fake_server(vec![text("ok"), text("ok")]).await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::User);
+
+    assert!(
+        turn_approvals(&mut agent, "one", Approval::No)
+            .await
+            .is_empty()
+    );
+    // Docs are not trusted config: a change applies silently.
+    fs::write(tmp.path().join(".agents/product.md"), "v2 product").unwrap();
+    assert!(
+        turn_approvals(&mut agent, "two", Approval::No)
+            .await
+            .is_empty()
+    );
+    let second = &requests.lock().unwrap()[1];
+    assert!(second["system"].to_string().contains("v2 product"));
 }

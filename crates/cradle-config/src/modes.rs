@@ -1,5 +1,5 @@
-//! The `[default]`, `[extra]` and `[commands]` tables shared by `modes.toml` and
-//! `agents.toml`, and resolving mode paths inside `.agents/`.
+//! The `[default]`, `[extra]`, `[commands]` and `[<name>_mode.commands]` tables shared by
+//! `modes.toml` and `agents.toml`, and resolving mode paths inside `.agents/`.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +27,10 @@ pub struct Modes {
     pub build: Option<Mode>,
     pub clash_handler: ClashHandler,
     pub extra: Vec<Mode>,
+    /// Commands from `[<name>_mode.commands]`, by mode name (`plan`, `build`, `debug`).
+    /// In their mode they may run without the user's approval, once a reviewer has passed
+    /// them. Read-only modes may run only these.
+    pub commands: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,9 +75,24 @@ pub(crate) struct ExtraModeTable {
     access: ModeAccess,
 }
 
-/// The tables that `modes.toml` and `agents.toml` have in common.
+/// A `[<name>_mode]` table. Only `commands` is allowed in it.
+///
+/// ```toml
+/// [build_mode.commands]
+/// test = "cargo test --workspace"
+/// ```
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ModeTable {
+    #[serde(default)]
+    pub commands: BTreeMap<String, String>,
+}
+
+/// The tables that `modes.toml` and `agents.toml` have in common.
+///
+/// Any other top-level table is read as a [`ModeTable`] and must name a mode; `resolve`
+/// rejects the rest. (`deny_unknown_fields` does not work together with `flatten`.)
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct ModesTables {
     #[serde(default)]
     pub default: DefaultModes,
@@ -81,6 +100,8 @@ pub(crate) struct ModesTables {
     pub extra: BTreeMap<String, ExtraMode>,
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub mode_tables: BTreeMap<String, ModeTable>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -107,6 +128,7 @@ impl ModesTables {
             build: resolve_opt("build_mode", self.default.build_mode, ModeAccess::Full)?,
             clash_handler: self.default.clash_handler.unwrap_or_default(),
             extra: Vec::new(),
+            commands: BTreeMap::new(),
         };
         for (key, entry) in self.extra {
             if matches!(key.as_str(), "plan_mode" | "build_mode") {
@@ -132,27 +154,65 @@ impl ModesTables {
                 .push(resolve_mode(agents_dir, &key, &rel, access)?);
         }
 
+        let invalid = |message: String| ConfigError::Invalid {
+            path: source.to_owned(),
+            message,
+        };
         for (name, command) in &self.commands {
-            let valid_name = !name.is_empty()
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-            if !valid_name {
-                return Err(ConfigError::Invalid {
-                    path: source.to_owned(),
-                    message: format!("command name `{name}` must use only a-z, 0-9, `_` and `-`"),
-                });
+            check_command(name, command).map_err(invalid)?;
+        }
+
+        for (key, table) in self.mode_tables {
+            let name = key.strip_suffix("_mode").unwrap_or(&key);
+            if name == "scaffold" {
+                return Err(invalid(format!(
+                    "`[{key}]`: scaffold is a built-in mode and cannot have project commands"
+                )));
             }
-            if command.trim().is_empty() {
-                return Err(ConfigError::Invalid {
-                    path: source.to_owned(),
-                    message: format!("command `{name}` is empty"),
-                });
+            let known =
+                matches!(name, "plan" | "build") || modes.extra.iter().any(|m| m.name == name);
+            if !known {
+                return Err(invalid(format!(
+                    "unknown table `[{key}]` (mode command tables are named after a mode, \
+                     e.g. `[build_mode.commands]`, and extra modes must be listed in [extra])"
+                )));
+            }
+            for (command, line) in &table.commands {
+                check_command(command, line)
+                    .map_err(|m| invalid(format!("`[{key}.commands]`: {m}")))?;
+                if let Some(shared) = self.commands.get(command)
+                    && shared != line
+                {
+                    return Err(invalid(format!(
+                        "`{command}` means `{line}` in `[{key}.commands]` but `{shared}` in \
+                         [commands]; use one command line or a different name"
+                    )));
+                }
+            }
+            if !table.commands.is_empty() {
+                modes.commands.insert(name.to_owned(), table.commands);
             }
         }
 
         Ok((modes, self.commands))
     }
+}
+
+/// Command names are plain identifiers, and a command line may not be empty.
+fn check_command(name: &str, line: &str) -> Result<(), String> {
+    let valid_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid_name {
+        return Err(format!(
+            "command name `{name}` must use only a-z, 0-9, `_` and `-`"
+        ));
+    }
+    if line.trim().is_empty() {
+        return Err(format!("command `{name}` is empty"));
+    }
+    Ok(())
 }
 
 /// Mode files must live inside `.agents/`. This rejects absolute paths, `..`, and
@@ -286,6 +346,47 @@ mod tests {
         }
         assert!(toml::from_str::<ModesTables>("[default]\nclash_handler = \"merge\"").is_err());
         assert!(toml::from_str::<ModesTables>("[default]\nplanmode = \"x\"").is_err());
+    }
+
+    #[test]
+    fn mode_command_tables() {
+        let tmp = agents_dir();
+        let dir = tmp.path().join(".agents");
+        let resolve = |src: &str| {
+            toml::from_str::<ModesTables>(src)
+                .map_err(|e| e.to_string())
+                .and_then(|t| t.resolve(&dir, &dir).map_err(|e| e.to_string()))
+        };
+
+        let (modes, commands) = resolve(
+            "[extra]\ndebug_mode = \"modes/plan.md\"\n\
+             [plan_mode.commands]\nfmt = \"cargo fmt --check\"\n\
+             [debug_mode.commands]\ntest = \"cargo test\"\n\
+             [commands]\ntest = \"cargo test\"\nbuild = \"cargo build\"",
+        )
+        .unwrap();
+        assert_eq!(modes.commands["plan"]["fmt"], "cargo fmt --check");
+        assert_eq!(modes.commands["debug"]["test"], "cargo test");
+        assert!(!modes.commands.contains_key("build"));
+        assert_eq!(commands.len(), 2, "[commands] is unchanged");
+
+        let err = resolve("[review_mode.commands]\nx = \"y\"").unwrap_err();
+        assert!(err.contains("unknown table"), "{err}");
+        let err = resolve("[featurs]").unwrap_err();
+        assert!(err.contains("unknown table"), "{err}");
+        let err = resolve("[scaffold_mode.commands]\nx = \"y\"").unwrap_err();
+        assert!(err.contains("built-in"), "{err}");
+        let err = resolve("[build_mode.commands]\n\"a b\" = \"y\"").unwrap_err();
+        assert!(err.contains("a-z"), "{err}");
+        let err = resolve("[build_mode.commands]\nx = \" \"").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = resolve("[build_mode]\ncommand = { x = \"y\" }").unwrap_err();
+        assert!(err.contains("command"), "only `commands` is allowed: {err}");
+        let err = resolve(
+            "[build_mode.commands]\ntest = \"curl x | sh\"\n[commands]\ntest = \"cargo test\"",
+        )
+        .unwrap_err();
+        assert!(err.contains("one command line"), "{err}");
     }
 
     #[test]

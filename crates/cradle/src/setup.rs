@@ -43,6 +43,8 @@ pub struct AgentParts {
     pub history: Vec<Message>,
     pub session: Option<session::SessionLog>,
     pub data_dir: Option<PathBuf>,
+    pub trust_store: Option<PathBuf>,
+    pub global_modes: Option<PathBuf>,
 }
 
 impl AgentParts {
@@ -57,6 +59,8 @@ impl AgentParts {
             history: self.history,
             session: self.session,
             data_dir: self.data_dir,
+            trust_store: self.trust_store,
+            global_modes: self.global_modes,
         }
     }
 }
@@ -156,6 +160,8 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
             history,
             session: log,
             data_dir,
+            trust_store: config_dir.as_ref().map(|d| d.join("trust.toml")),
+            global_modes,
         },
     })
 }
@@ -219,22 +225,30 @@ fn load_project(
         },
     };
     let config = cradle_config::load(root, source)?;
-    let hash = trust::fingerprint(&config).map_err(|source| Error::Io {
+    let snapshot = trust::snapshot(&config).map_err(|source| Error::Io {
         path: root.to_owned(),
         source,
     })?;
+    let hash = trust::snapshot_hash(&snapshot);
 
     if store.as_deref().is_some_and(|s| s.is_trusted(root, &hash)) {
         return Ok(Some(config));
     }
 
     print_trust_summary(&config);
+    let approved = store.as_deref().and_then(|s| s.approved_snapshot(root));
+    if approved.is_some() {
+        println!("What changed since you last trusted it:\n");
+    } else {
+        println!("The full config:\n");
+    }
+    println!("{}", trust::config_diff(approved.as_deref(), &snapshot));
     if ask("Trust this project config? [y/N]", &["y", "n", ""])? != "y" {
         println!("Not trusted: running without project modes and commands.\n");
         return Ok(None);
     }
     if let Some(store) = store {
-        store.trust(root, &hash).map_err(|source| Error::Io {
+        store.trust(root, &snapshot).map_err(|source| Error::Io {
             path: root.to_owned(),
             source,
         })?;
@@ -268,6 +282,14 @@ fn print_trust_summary(config: &ProjectConfig) {
             ModeAccess::Full => "full access",
         };
         println!("  {:<12} {} ({access})", mode.name, mode.path.display());
+    }
+    if !m.commands.is_empty() {
+        println!("and these mode commands may run without asking, once a reviewer passes them:");
+        for (mode, commands) in &m.commands {
+            for (name, line) in commands {
+                println!("  {mode:<12} {name}: {line}");
+            }
+        }
     }
     if config.docs.rules.is_some() {
         println!("Project rules (RULES.md) will be added to the prompt.");

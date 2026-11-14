@@ -412,6 +412,10 @@ impl App {
                 self.mode = name;
                 self.read_only = read_only;
             }
+            AgentEvent::ModesChanged(modes) => {
+                self.mode_names = modes.iter().map(|(name, _)| name.clone()).collect();
+                self.modes = modes;
+            }
             AgentEvent::ReviewChanged(policy) => self.review = policy,
             AgentEvent::ModelChanged { provider, model } => {
                 self.items
@@ -1154,6 +1158,8 @@ mod tests {
             history: vec![],
             session: None,
             data_dir: None,
+            trust_store: None,
+            global_modes: None,
         };
         let info = StartInfo {
             root: dir,

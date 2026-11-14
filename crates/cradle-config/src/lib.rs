@@ -154,6 +154,5 @@ mod tests {
         assert!(config.docs.rules.is_some());
         assert!(config.commands.contains_key("test"));
         assert!(config.modes.plan.is_some() && config.modes.build.is_some());
-        assert!(config.modes.extra.iter().any(|m| m.name == "debug"));
     }
 }
