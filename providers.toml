@@ -32,7 +32,11 @@ auth = "none"
 id = "claude-code"
 kind = "claude_code"
 binary = "claude"
-models = ["opus", "sonnet", "haiku", "fable"] # Claude Code's aliases for the latest of each
+# Aliases for the latest of each, then specific versions (`--model` takes either).
+models = [
+  "opus", "sonnet", "haiku", "fable",
+  "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1",
+]
 version = ">=2.1, <3.0" # developed against 2.1.311
 
 [[provider]]

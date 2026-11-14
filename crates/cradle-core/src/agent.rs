@@ -23,12 +23,13 @@ use cradle_tools::{Access, PathGuard, ToolCall, ToolDefinition, ToolError, Write
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::modes::ModeSet;
+use crate::modes::{FileEdits, ModeSet};
 use crate::prompt;
 use crate::review::{self, ChangedFile, Verdict};
 use crate::session::SessionLog;
 
 const MAX_TOKENS: u32 = 64_000;
+const SCAFFOLD_PROMPT: &str = include_str!("../prompts/scaffold.md");
 const PREVIEW_LINES: usize = 4;
 
 /// Who approves `run_command`.
@@ -74,9 +75,21 @@ pub enum AgentEvent {
     },
     ReviewChanged(ReviewPolicy),
     Usage(Usage),
+    /// Every file changed this session, after each change.
+    FilesChanged(Vec<FileStat>),
+    /// A saved conversation replaced the current one.
+    SessionLoaded(Vec<Message>),
     Notice(String),
     Error(String),
     TurnFinished,
+}
+
+/// Lines added and removed in one file since the session started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
 }
 
 #[derive(Debug)]
@@ -84,16 +97,18 @@ pub struct ApprovalRequest {
     pub title: String,
     pub body: String,
     pub note: Option<String>,
-    /// Whether "always allow this for the session" is offered.
-    pub allow_always: bool,
+    /// The label for "allow this for the rest of the session", if offered.
+    pub always: Option<String>,
     pub reply: oneshot::Sender<Approval>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Approval {
     Yes,
     Always,
     No,
+    /// Not this; the user says what to do instead.
+    Change(String),
 }
 
 #[derive(Debug)]
@@ -108,10 +123,16 @@ pub enum AgentCommand {
     Send(String),
     SetMode(String),
     CycleMode,
+    /// Cycle modes in reverse.
+    CycleModeBack,
     SetReview(ReviewPolicy),
     ShowDiff,
     Clear,
-    /// Switch model (same provider). The conversation continues on the new model.
+    /// Run a turn that sets up `.agents/` from what the project already has.
+    Scaffold,
+    /// Continue a saved transcript instead of the current conversation.
+    LoadSession(PathBuf),
+    /// Switch model or provider. The conversation continues on the new model.
     SetBackend(Box<Backend>),
 }
 
@@ -181,6 +202,10 @@ struct Agent {
     mcp: Option<(McpServer, mpsc::UnboundedReceiver<ToolRequest>)>,
     /// For CLI backends: the CLI's own session id, to continue the conversation.
     cli_session: Option<String>,
+    /// A `/scaffold` turn is running: missing project config may be created.
+    scaffolding: bool,
+    /// The user allowed every file edit for the rest of the session.
+    edits_allowed: bool,
     events: mpsc::UnboundedSender<AgentEvent>,
     cancel: Arc<Notify>,
 }
@@ -234,6 +259,8 @@ impl Agent {
             protected_changed: BTreeSet::new(),
             mcp: None,
             cli_session: None,
+            scaffolding: false,
+            edits_allowed: false,
             events,
             cancel,
         }
@@ -243,23 +270,7 @@ impl Agent {
         self.emit_mode();
         self.emit(AgentEvent::ReviewChanged(self.review));
         if self.backend.is_cli() {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let tools = self
-                .tools
-                .iter()
-                .map(|t| McpTool {
-                    name: t.name.to_owned(),
-                    description: t.description.clone(),
-                    input_schema: t.input_schema.clone(),
-                    read_only: t.access == Access::Read,
-                })
-                .collect();
-            match cradle_mcp::start(tools, tx).await {
-                Ok(server) => self.mcp = Some((server, rx)),
-                Err(e) => self.emit(AgentEvent::Error(format!(
-                    "cannot start Cradle's tool server: {e}"
-                ))),
-            }
+            self.start_mcp().await;
             if !self.history.is_empty() {
                 self.emit(AgentEvent::Notice(format!(
                     "{} starts a fresh session: the resumed messages are shown but not sent.",
@@ -279,6 +290,22 @@ impl Agent {
                     self.run_turn(text).await;
                     self.emit(AgentEvent::TurnFinished);
                 }
+                AgentCommand::Scaffold => {
+                    let mode = self.modes.get(&self.mode).expect("current mode exists");
+                    if mode.effective_edits() == FileEdits::Deny {
+                        self.emit(AgentEvent::Notice(format!(
+                            "File edits are off in `{}` mode: switch to a mode that allows them \
+                             (Tab) and run /scaffold again.",
+                            mode.name
+                        )));
+                        self.emit(AgentEvent::TurnFinished);
+                        continue;
+                    }
+                    self.scaffolding = true;
+                    self.run_turn(SCAFFOLD_PROMPT.to_owned()).await;
+                    self.scaffolding = false;
+                    self.emit(AgentEvent::TurnFinished);
+                }
                 AgentCommand::SetMode(name) => {
                     if self.modes.get(&name).is_some() {
                         self.mode = name;
@@ -295,6 +322,10 @@ impl Agent {
                     self.mode = self.modes.next_after(&self.mode).name.clone();
                     self.emit_mode();
                 }
+                AgentCommand::CycleModeBack => {
+                    self.mode = self.modes.prev_before(&self.mode).name.clone();
+                    self.emit_mode();
+                }
                 AgentCommand::SetReview(policy) => {
                     self.review = policy;
                     self.emit(AgentEvent::ReviewChanged(policy));
@@ -309,11 +340,25 @@ impl Agent {
                     }
                 }
                 AgentCommand::SetBackend(backend) => {
-                    if backend.is_cli() != self.backend.is_cli() {
-                        self.emit(AgentEvent::Error(
-                            "Switching between a CLI and an API provider needs a restart.".into(),
-                        ));
-                        continue;
+                    if backend.provider() != self.backend.provider() {
+                        // A CLI's session id means nothing to another provider.
+                        self.cli_session = None;
+                        self.announced_mode = None;
+                        if backend.is_cli() && !self.history.is_empty() {
+                            self.emit(AgentEvent::Notice(format!(
+                                "{} starts a fresh session: earlier messages are not sent.",
+                                backend.provider()
+                            )));
+                        }
+                    }
+                    if backend.is_cli() && self.mcp.is_none() {
+                        self.start_mcp().await;
+                    }
+                    if !backend.supports_tools() {
+                        self.emit(AgentEvent::Notice(format!(
+                            "{} does not support tools: chat only, no file access.",
+                            backend.provider()
+                        )));
                     }
                     self.backend = Arc::new(*backend);
                     self.emit(AgentEvent::ModelChanged {
@@ -330,7 +375,55 @@ impl Agent {
                     }
                     self.emit(AgentEvent::Notice("Started a new conversation.".into()));
                 }
+                AgentCommand::LoadSession(path) => match crate::session::read(&path) {
+                    Ok(mut history) => {
+                        close_dangling_tool_calls(&mut history);
+                        match SessionLog::open(path.clone()) {
+                            Ok(log) => self.session = Some(log),
+                            Err(e) => self.emit(AgentEvent::Error(format!(
+                                "cannot append to {}: {e}",
+                                path.display()
+                            ))),
+                        }
+                        self.history = history;
+                        self.announced_mode = None;
+                        self.cli_session = None;
+                        self.emit(AgentEvent::SessionLoaded(self.history.clone()));
+                        if self.backend.is_cli() {
+                            self.emit(AgentEvent::Notice(format!(
+                                "{} starts a fresh session: the resumed messages are shown but \
+                                 not sent.",
+                                self.backend.provider()
+                            )));
+                        }
+                    }
+                    Err(e) => self.emit(AgentEvent::Error(format!(
+                        "cannot read {}: {e}",
+                        path.display()
+                    ))),
+                },
             }
+        }
+    }
+
+    /// Start Cradle's MCP tool server, which CLI backends call for every tool.
+    async fn start_mcp(&mut self) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tools = self
+            .tools
+            .iter()
+            .map(|t| McpTool {
+                name: t.name.to_owned(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+                read_only: t.access == Access::Read,
+            })
+            .collect();
+        match cradle_mcp::start(tools, tx).await {
+            Ok(server) => self.mcp = Some((server, rx)),
+            Err(e) => self.emit(AgentEvent::Error(format!(
+                "cannot start Cradle's tool server: {e}"
+            ))),
         }
     }
 
@@ -590,6 +683,17 @@ impl Agent {
         self.emit(started(call.summary()));
 
         let mode = self.modes.get(&self.mode).expect("current mode exists");
+        let file_write = matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
+        if file_write && mode.access == ModeAccess::Full && mode.file_edits == FileEdits::Deny {
+            return (
+                format!(
+                    "File edits are turned off in `{}` mode. Describe the change instead, or \
+                     ask the user to switch modes.",
+                    mode.name
+                ),
+                true,
+            );
+        }
         if call.access() == Access::Write && mode.access == ModeAccess::Read {
             return (
                 format!(
@@ -643,7 +747,11 @@ impl Agent {
                     .map_err(|_| ToolError::new("The question was dismissed."))
             }
             ToolCall::WriteFile { path, content } => {
-                let write = tfs::prepare_write(&self.guard, &path, &content)?;
+                let write = if self.scaffolding {
+                    tfs::prepare_scaffold_write(&self.guard, &path, &content)?
+                } else {
+                    tfs::prepare_write(&self.guard, &path, &content)?
+                };
                 self.apply_write(write).await
             }
             ToolCall::EditFile {
@@ -669,21 +777,38 @@ impl Agent {
             WriteClass::Normal => None,
             WriteClass::Protected(reason) => Some(format!("Protected file: {reason}.")),
             WriteClass::AgentsDoc => Some("Project documentation in .agents/.".to_owned()),
+            WriteClass::AgentsConfig => Some(
+                "Project config: it decides which commands and modes the agent gets. Cradle \
+                 asks you to trust it on the next start."
+                    .to_owned(),
+            ),
         };
-        if let Some(note) = note {
+        let edits = self
+            .modes
+            .get(&self.mode)
+            .map_or(FileEdits::Ask, |m| m.effective_edits());
+        // Protected files and .agents/ always ask; other files as the mode says.
+        let ask_always = note.is_none() && edits == FileEdits::Ask && !self.edits_allowed;
+        if note.is_some() || ask_always {
             let verb = if write.existed { "Change" } else { "Create" };
-            let approval = self
-                .ask(
-                    format!("{verb} {rel}?"),
-                    write.diff.clone(),
-                    Some(note),
-                    false,
-                )
-                .await;
-            if approval == Approval::No {
-                return Err(ToolError::new(
-                    "The user declined this change. Ask them how they want to proceed.",
-                ));
+            let always = ask_always.then(|| "allow all file edits this session".to_owned());
+            match self
+                .ask(format!("{verb} {rel}?"), write.diff.clone(), note, always)
+                .await
+            {
+                Approval::Yes => {}
+                Approval::Always => self.edits_allowed = true,
+                Approval::No => {
+                    return Err(ToolError::new(
+                        "The user declined this change. Ask them how they want to proceed.",
+                    ));
+                }
+                Approval::Change(feedback) => {
+                    return Err(ToolError::new(format!(
+                        "The user did not apply this change and asks for something different: \
+                         {feedback}"
+                    )));
+                }
             }
         }
 
@@ -712,6 +837,7 @@ impl Agent {
             title: summary.clone(),
             diff: write.diff,
         });
+        self.emit(AgentEvent::FilesChanged(self.file_stats()));
         Ok(summary)
     }
 
@@ -771,7 +897,8 @@ impl Agent {
 
             if !approved {
                 let body = format!("$ {line}\n\nReason given by the agent:\n{reason}");
-                match self.ask(format!("Run `{name}`?"), body, note, true).await {
+                let always = Some("always this session".to_owned());
+                match self.ask(format!("Run `{name}`?"), body, note, always).await {
                     Approval::Yes => {
                         self.protected_changed.clear();
                     }
@@ -782,6 +909,11 @@ impl Agent {
                     Approval::No => {
                         return Err(ToolError::new(format!(
                             "The user declined to run `{name}`."
+                        )));
+                    }
+                    Approval::Change(feedback) => {
+                        return Err(ToolError::new(format!(
+                            "The user did not run `{name}` and says: {feedback}"
                         )));
                     }
                 }
@@ -806,19 +938,34 @@ impl Agent {
             .collect()
     }
 
+    /// Lines added and removed per changed file, for the sidebar.
+    fn file_stats(&self) -> Vec<FileStat> {
+        self.changed_files()
+            .into_iter()
+            .map(|f| {
+                let (added, removed) = diff_counts(&f.diff);
+                FileStat {
+                    path: f.path,
+                    added,
+                    removed,
+                }
+            })
+            .collect()
+    }
+
     async fn ask(
         &self,
         title: String,
         body: String,
         note: Option<String>,
-        allow_always: bool,
+        always: Option<String>,
     ) -> Approval {
         let (reply, answer) = oneshot::channel();
         self.emit(AgentEvent::Approval(ApprovalRequest {
             title,
             body,
             note,
-            allow_always,
+            always,
             reply,
         }));
         answer.await.unwrap_or(Approval::No)
@@ -877,6 +1024,22 @@ fn refusal(stop: &StopReason) -> String {
     }
 }
 
+/// Added and removed lines in a unified diff, ignoring the file headers.
+fn diff_counts(diff: &str) -> (usize, usize) {
+    let mut counts = (0, 0);
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            counts.0 += 1;
+        } else if line.starts_with('-') {
+            counts.1 += 1;
+        }
+    }
+    counts
+}
+
 fn preview(content: &str) -> String {
     let lines: Vec<&str> = content.lines().take(PREVIEW_LINES).collect();
     let more = content.lines().count().saturating_sub(PREVIEW_LINES);
@@ -933,6 +1096,12 @@ mod tests {
         ));
         close_dangling_tool_calls(&mut history);
         assert_eq!(history.len(), 3, "nothing to close twice");
+    }
+
+    #[test]
+    fn counts_diff_lines() {
+        let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n+more\n same\n";
+        assert_eq!(diff_counts(diff), (2, 1));
     }
 
     #[test]

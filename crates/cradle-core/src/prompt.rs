@@ -10,7 +10,7 @@ use cradle_config::{EntryBody, ModeAccess, ProjectConfig, SourceKind};
 use cradle_tools::hygiene::reveal_invisible;
 use cradle_tools::{Access, ToolDefinition};
 
-use crate::modes::ActiveMode;
+use crate::modes::{ActiveMode, FileEdits};
 
 const BASE: &str = "\
 You are Cradle, a coding agent working inside a software project. You act only through the \
@@ -26,6 +26,7 @@ does that.
 - Some files are hidden (ignored and secret files, .git/). Some writes need the user's \
 approval (build scripts, manifests, CI config, .agents/ docs), and project config in \
 .agents/ (RULES.md, modes.toml, modes/) is read-only.
+- When the user declines a change and says what to do instead, follow that.
 - When a decision belongs to the user, ask with ask_user instead of guessing.
 
 The current mode and what it allows are announced in system messages. Follow the latest one.
@@ -99,23 +100,59 @@ pub fn system_prompt(root: &Path, project: Option<&ProjectConfig>) -> String {
             writeln!(out, "- {item}").unwrap();
         }
     }
+    if !project.skills.is_empty() {
+        out.push_str(
+            "\n\nSkills: instructions for specific tasks. When a task matches one, read its file \
+             with read_file and follow it.\n",
+        );
+        for skill in &project.skills {
+            let path = skill
+                .path
+                .strip_prefix(&project.root)
+                .unwrap_or(&skill.path)
+                .display();
+            if skill.description.is_empty() {
+                writeln!(out, "- {} ({path})", skill.name).unwrap();
+            } else {
+                writeln!(
+                    out,
+                    "- {}: {} ({path})",
+                    skill.name,
+                    reveal_invisible(&skill.description)
+                )
+                .unwrap();
+            }
+        }
+    }
     out
 }
 
 /// The system message sent when a mode becomes active.
 pub fn mode_message(mode: &ActiveMode, tools: &[ToolDefinition]) -> String {
+    let edits = mode.effective_edits();
     let allowed: Vec<&str> = tools
         .iter()
-        .filter(|t| mode.access == ModeAccess::Full || t.access == Access::Read)
+        .filter(|t| match t.name {
+            "write_file" | "edit_file" => edits != FileEdits::Deny,
+            _ => mode.access == ModeAccess::Full || t.access == Access::Read,
+        })
         .map(|t| t.name)
         .collect();
-    let rule = match mode.access {
-        ModeAccess::Read => {
+    let rule = match (mode.access, edits) {
+        (ModeAccess::Read, _) => {
             "This mode is read-only: you cannot write files or run commands, and the harness \
              will refuse if you try. If the task needs changes, finish your plan and ask the \
              user to switch to build mode (Shift+Tab)."
         }
-        ModeAccess::Full => {
+        (ModeAccess::Full, FileEdits::Deny) => {
+            "File edits are off in this mode; you may run configured commands, subject to \
+             approvals."
+        }
+        (ModeAccess::Full, FileEdits::Ask) => {
+            "You may change files (the user reviews each change first) and run configured \
+             commands, subject to approvals."
+        }
+        (ModeAccess::Full, FileEdits::Allow) => {
             "You may change files and run configured commands, subject to approvals."
         }
     };
@@ -135,11 +172,7 @@ mod tests {
     fn read_only_mode_lists_only_read_tools() {
         let tools = cradle_tools::definitions(&[]);
         let msg = mode_message(
-            &ActiveMode {
-                name: "plan".into(),
-                access: ModeAccess::Read,
-                prompt: "Plan it.".into(),
-            },
+            &ActiveMode::parse("plan", ModeAccess::Read, "Plan it.").unwrap(),
             &tools,
         );
         assert!(msg.contains("read_file") && msg.contains("ask_user"));

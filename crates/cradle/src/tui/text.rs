@@ -99,6 +99,35 @@ impl Input {
         }
     }
 
+    /// Delete from the start of the current line to the cursor (or the newline before it,
+    /// at the start of a line).
+    pub fn delete_to_line_start(&mut self) {
+        let start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+        if start == self.cursor {
+            self.backspace();
+            return;
+        }
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Delete the word before the cursor, and any spaces after it.
+    pub fn delete_word(&mut self) {
+        let before = &self.text[..self.cursor];
+        let trimmed = before.trim_end_matches([' ', '\t']);
+        let start = trimmed
+            .rfind(|c: char| c.is_whitespace())
+            .map_or(0, |i| i + 1);
+        let start = if start == self.cursor && start > 0 {
+            // Only a newline before the cursor: delete it.
+            start - 1
+        } else {
+            start
+        };
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
     pub fn left(&mut self) {
         if let Some(c) = self.text[..self.cursor].chars().next_back() {
             self.cursor -= c.len_utf8();
@@ -186,6 +215,26 @@ mod tests {
         input.home();
         assert_eq!(input.layout(10).1, (1, 0));
         assert_eq!(input.take(), "hélo\nx");
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn deletes_lines_and_words() {
+        let mut input = Input::default();
+        input.insert_str("one two  \nthree four");
+        input.delete_word();
+        assert_eq!(input.text(), "one two  \nthree ");
+        input.delete_to_line_start();
+        assert_eq!(input.text(), "one two  \n");
+        input.delete_to_line_start();
+        assert_eq!(
+            input.text(),
+            "one two  ",
+            "at a line start, joins the lines"
+        );
+        input.delete_word();
+        assert_eq!(input.text(), "one ");
+        input.delete_to_line_start();
         assert!(input.is_empty());
     }
 }

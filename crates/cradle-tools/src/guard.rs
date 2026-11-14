@@ -82,6 +82,9 @@ pub enum WriteClass {
     Protected(&'static str),
     /// A `.agents/` doc: needs user approval.
     AgentsDoc,
+    /// New project config (`.agents/RULES.md`, `modes.toml`, `modes/`), created by
+    /// `/scaffold`: needs user approval, and the project must be trusted again.
+    AgentsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,11 +163,7 @@ impl PathGuard {
             return Err(GuardError::Invalid(input.to_owned()));
         }
 
-        if rel == Path::new("agents.toml")
-            || rel == Path::new(".agents/RULES.md")
-            || rel == Path::new(".agents/modes.toml")
-            || rel.starts_with(".agents/modes")
-        {
+        if is_agents_config(rel) {
             return Err(GuardError::AgentsConfig(display(rel)));
         }
         if rel.starts_with(".agents") {
@@ -175,6 +174,19 @@ impl PathGuard {
             return Ok((resolved, WriteClass::Protected(reason)));
         }
         Ok((resolved, WriteClass::Normal))
+    }
+
+    /// Resolve a path for creating project config during `/scaffold`. Only files that do
+    /// not exist yet; everything else is classified as by [`PathGuard::resolve_write`].
+    pub fn resolve_scaffold(&self, input: &str) -> Result<(Resolved, WriteClass), GuardError> {
+        let resolved = self.resolve(input)?;
+        if !is_agents_config(&resolved.rel) {
+            return self.resolve_write(input);
+        }
+        if resolved.rel == Path::new("agents.toml") || resolved.abs.exists() {
+            return Err(GuardError::AgentsConfig(display(&resolved.rel)));
+        }
+        Ok((resolved, WriteClass::AgentsConfig))
     }
 
     /// Whether `rel` (relative to the root) is hidden by `.gitignore` or secret patterns.
@@ -243,6 +255,15 @@ impl PathGuard {
             .map_err(|_| GuardError::Outside(input.to_owned()))?;
         Ok(Resolved { abs, rel })
     }
+}
+
+/// Project config the agent may never change: it decides which commands and modes the
+/// agent gets.
+fn is_agents_config(rel: &Path) -> bool {
+    rel == Path::new("agents.toml")
+        || rel == Path::new(".agents/RULES.md")
+        || rel == Path::new(".agents/modes.toml")
+        || rel.starts_with(".agents/modes")
 }
 
 pub(crate) fn display(path: &Path) -> String {
@@ -344,6 +365,15 @@ mod tests {
         );
         assert!(matches!(
             guard.resolve_write(".agents/RULES.md"),
+            Err(GuardError::AgentsConfig(_))
+        ));
+        assert_eq!(
+            guard.resolve_scaffold(".agents/RULES.md").unwrap().1,
+            WriteClass::AgentsConfig,
+            "scaffolding may create config"
+        );
+        assert!(matches!(
+            guard.resolve_scaffold("agents.toml"),
             Err(GuardError::AgentsConfig(_))
         ));
         assert!(matches!(

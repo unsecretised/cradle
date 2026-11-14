@@ -202,6 +202,20 @@ pub fn prepare_write(
     Ok(prepared(target, class, old.as_deref(), content.to_owned()))
 }
 
+/// Like [`prepare_write`], but may also create project config that does not exist yet
+/// (for `/scaffold`).
+pub fn prepare_scaffold_write(
+    guard: &PathGuard,
+    path: &str,
+    content: &str,
+) -> Result<PreparedWrite, ToolError> {
+    let (target, class) = guard.resolve_scaffold(path)?;
+    if class != WriteClass::AgentsConfig {
+        return prepare_write(guard, path, content);
+    }
+    Ok(prepared(target, class, None, content.to_owned()))
+}
+
 /// Prepare an exact-string replacement in an existing file.
 pub fn prepare_edit(
     guard: &PathGuard,

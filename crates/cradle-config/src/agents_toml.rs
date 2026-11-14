@@ -111,6 +111,7 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
         bugfixes: inline_entries(parsed.bugfixes),
         modes,
         commands,
+        skills: crate::skills::list(&root.join(AGENTS_DIR).join("skills"))?,
     })
 }
 

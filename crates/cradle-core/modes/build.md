@@ -1,3 +1,6 @@
+---
+file_edits: ask
+---
 Carry out the task.
 
 - Read files before editing them, and keep changes scoped to the task.

@@ -147,7 +147,7 @@ async fn turn(handle: &mut AgentHandle, prompt: &str, approve: Approval) -> bool
         match event {
             AgentEvent::Approval(req) => {
                 asked = true;
-                req.reply.send(approve).unwrap();
+                req.reply.send(approve.clone()).unwrap();
             }
             AgentEvent::TurnFinished => return asked,
             _ => {}
@@ -289,4 +289,44 @@ async fn reviewer_is_skipped_after_protected_file_changes() {
     assert!(tmp.path().join("build.rs").exists());
     assert!(tmp.path().join("ran.txt").exists());
     assert_eq!(requests.lock().unwrap().len(), 3, "no reviewer call");
+}
+
+#[tokio::test]
+async fn build_mode_asks_before_writing_and_always_allows_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    let (url, _requests) = fake_server(vec![
+        tool_call("t1", "write_file", json!({"path": "a.txt", "content": "a"})),
+        text("ok"),
+        tool_call("t2", "write_file", json!({"path": "b.txt", "content": "b"})),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::User);
+
+    assert!(turn(&mut agent, "write a", Approval::Always).await);
+    assert!(tmp.path().join("a.txt").exists());
+    assert!(
+        !turn(&mut agent, "write b", Approval::No).await,
+        "allowed for the session"
+    );
+    assert!(tmp.path().join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn requested_changes_reach_the_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    let (url, requests) = fake_server(vec![
+        tool_call("t1", "write_file", json!({"path": "a.txt", "content": "a"})),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "build", ReviewPolicy::User);
+
+    let feedback = Approval::Change("call it b.txt".into());
+    assert!(turn(&mut agent, "write a", feedback).await);
+    assert!(!tmp.path().join("a.txt").exists());
+    let (content, is_error) = tool_result(&requests, 1);
+    assert!(is_error && content.contains("call it b.txt"), "{content}");
 }

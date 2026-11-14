@@ -7,14 +7,20 @@ mod picker;
 mod text;
 mod view;
 
-use std::io::stdout;
+use std::cell::Cell;
+use std::io::{Write, stdout};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use cradle_backends::Usage;
-use cradle_core::{AgentCommand, AgentEvent, AgentHandle, Approval, ReviewPolicy, Verdict};
+use cradle_backends::{BackendError, Block, Message, Role, Usage};
+use cradle_core::session::SessionInfo;
+use cradle_core::{
+    AgentCommand, AgentEvent, AgentHandle, Approval, FileStat, ReviewPolicy, Verdict,
+};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use futures_util::StreamExt;
@@ -31,10 +37,32 @@ use cradle_core::AgentSetup;
 use picker::{ModelPicker, PickerAction};
 use text::Input;
 
+/// Mouse button and wheel reports (SGR encoding), without motion tracking, which would
+/// redraw on every mouse move.
+const ENABLE_MOUSE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const DISABLE_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+const SCROLL_LINES: usize = 3;
+
 pub async fn run(session: Session) -> Result<(), Error> {
     let mut terminal = ratatui::init();
     let _ = execute!(stdout(), EnableBracketedPaste);
+    let _ = stdout()
+        .write_all(ENABLE_MOUSE)
+        .and_then(|()| stdout().flush());
+    // Where supported (kitty protocol), Shift+Enter and Cmd+Backspace are reported.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
     let result = start(&mut terminal, session).await;
+    if enhanced {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = stdout()
+        .write_all(DISABLE_MOUSE)
+        .and_then(|()| stdout().flush());
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
@@ -83,6 +111,7 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         user_config,
     };
     let mut app = App::new(info, &setup);
+    app.load_models();
     let mut handle = cradle_core::spawn(setup);
     event_loop(terminal, &mut keys, &mut app, &mut handle).await
 }
@@ -98,6 +127,8 @@ struct StartInfo<'a> {
 
 /// Results of work the UI started in the background.
 enum UiEvent {
+    /// `provider/model` for every usable provider, and why the current provider's models
+    /// could not be listed live.
     Models(Vec<String>, Option<String>),
 }
 
@@ -173,9 +204,12 @@ pub(crate) enum Modal {
         title: String,
         body: String,
         note: Option<String>,
-        allow_always: bool,
+        /// The label for "allow for the rest of the session", if offered.
+        always: Option<String>,
         reply: Option<oneshot::Sender<Approval>>,
         scroll: usize,
+        /// What to change instead, while the user types it (after `c`).
+        feedback: Option<Input>,
     },
     Question {
         question: String,
@@ -186,12 +220,22 @@ pub(crate) enum Modal {
     },
     Help,
     Model(ModelPicker),
+    Session {
+        sessions: Vec<SessionInfo>,
+        selected: usize,
+    },
 }
 
 pub(crate) struct App {
     pub items: Vec<Item>,
     /// Lines scrolled up from the bottom of the transcript.
     pub scroll: usize,
+    /// The furthest the transcript can scroll, as of the last draw.
+    pub max_scroll: Cell<usize>,
+    /// Files changed this session.
+    pub files: Vec<FileStat>,
+    /// Show the sidebar (when the terminal is wide enough).
+    pub sidebar: bool,
     pub input: Input,
     pub modal: Option<Modal>,
     pub busy: bool,
@@ -209,12 +253,19 @@ pub(crate) struct App {
     quit_armed: bool,
     providers: Vec<ProviderSpec>,
     user_config: Option<std::path::PathBuf>,
+    root: PathBuf,
+    data_dir: Option<PathBuf>,
     ui: mpsc::UnboundedSender<UiEvent>,
     ui_events: Option<mpsc::UnboundedReceiver<UiEvent>>,
     /// Mode names and whether each is read-only, for suggestions.
     pub modes: Vec<(String, bool)>,
-    /// Models offered as `/model` suggestions (configured, then any listed live).
+    /// The project's skills (`.agents/skills/`).
+    skills: Vec<cradle_config::Skill>,
+    /// `provider/model` offered by `/model` (configured, then any listed live).
     known_models: Vec<String>,
+    /// Whether `known_models` has been listed live yet.
+    models_loaded: bool,
+    models_error: Option<String>,
     pub suggest_index: usize,
     /// Esc hides suggestions until the input changes.
     suggest_hidden: bool,
@@ -238,10 +289,7 @@ impl App {
             .providers
             .iter()
             .find(|p| p.id == setup.backend.provider())
-            .map(|p| match &p.backend {
-                SpecBackend::Http(h) => h.models.clone(),
-                SpecBackend::Cli(c) => c.models.clone(),
-            })
+            .map(|p| configured_models(p).collect())
             .unwrap_or_default();
         let mut items = vec![Item::Notice(format!(
             "cradle in {} · /help for commands",
@@ -253,6 +301,7 @@ impl App {
             ));
         }
         if info.resumed > 0 {
+            items.extend(history_items(&setup.history));
             items.push(Item::Notice(format!(
                 "Resumed a conversation with {} messages.",
                 info.resumed
@@ -261,6 +310,9 @@ impl App {
         App {
             items,
             scroll: 0,
+            max_scroll: Cell::new(0),
+            files: Vec::new(),
+            sidebar: true,
             input: Input::default(),
             modal: None,
             busy: false,
@@ -278,10 +330,19 @@ impl App {
             quit_armed: false,
             providers: info.providers,
             user_config: info.user_config,
+            root: info.root.to_path_buf(),
+            data_dir: setup.data_dir.clone(),
             ui,
             ui_events: Some(ui_events),
             modes,
+            skills: setup
+                .project
+                .as_ref()
+                .map(|p| p.skills.clone())
+                .unwrap_or_default(),
             known_models,
+            models_loaded: false,
+            models_error: None,
             suggest_index: 0,
             suggest_hidden: false,
         }
@@ -334,9 +395,10 @@ impl App {
                     title: req.title,
                     body: req.body,
                     note: req.note,
-                    allow_always: req.allow_always,
+                    always: req.always,
                     reply: Some(req.reply),
                     scroll: 0,
+                    feedback: None,
                 })
             }
             AgentEvent::Question(req) => {
@@ -366,6 +428,15 @@ impl App {
                 self.model = model;
             }
             AgentEvent::Usage(usage) => self.usage = usage,
+            AgentEvent::FilesChanged(files) => self.files = files,
+            AgentEvent::SessionLoaded(history) => {
+                self.items = history_items(&history);
+                self.items.push(Item::Notice(format!(
+                    "Resumed a conversation with {} messages.",
+                    history.len()
+                )));
+                self.scroll = 0;
+            }
             AgentEvent::Notice(n) => self.items.push(Item::Notice(n)),
             AgentEvent::Error(e) => self.items.push(Item::Error(e)),
             AgentEvent::TurnFinished => {
@@ -381,13 +452,51 @@ impl App {
     fn on_terminal(&mut self, event: Event, handle: &AgentHandle) {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key, handle),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Paste(text) => match &mut self.modal {
-                Some(Modal::Question { input, .. }) => input.insert_str(&text.replace('\r', "")),
+                Some(Modal::Question { input, .. })
+                | Some(Modal::Approval {
+                    feedback: Some(input),
+                    ..
+                }) => input.insert_str(&text.replace('\r', "")),
                 Some(Modal::Model(picker)) => picker.insert_str(&text),
                 Some(_) => {}
                 None => self.input.insert_str(&text.replace('\r', "")),
             },
             _ => {}
+        }
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let up = match mouse.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return,
+        };
+        match &mut self.modal {
+            Some(Modal::Approval { scroll, .. }) if up => *scroll = scroll.saturating_sub(1),
+            Some(Modal::Approval { scroll, .. }) => *scroll += 1,
+            Some(_) => {}
+            None if up => self.scroll_by(SCROLL_LINES as isize),
+            None => self.scroll_by(-(SCROLL_LINES as isize)),
+        }
+    }
+
+    /// Scroll the transcript; positive is up (older).
+    fn scroll_by(&mut self, lines: isize) {
+        self.scroll = self
+            .scroll
+            .saturating_add_signed(lines)
+            .min(self.max_scroll.get());
+    }
+
+    fn cycle_mode(&mut self, back: bool, handle: &AgentHandle) {
+        if self.busy {
+            self.note("Wait for the turn to finish before switching modes.");
+        } else if back {
+            send(handle, AgentCommand::CycleModeBack);
+        } else {
+            send(handle, AgentCommand::CycleMode);
         }
     }
 
@@ -412,23 +521,25 @@ impl App {
         }
 
         let before = self.input.text().to_owned();
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let cmd = key.modifiers.contains(KeyModifiers::SUPER);
         match key.code {
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-            {
-                self.input.insert('\n')
-            }
+            // Terminals without the kitty protocol send Shift+Enter as plain Enter; some
+            // are set up to send Alt+Enter or Ctrl+J instead.
+            KeyCode::Enter if shift || alt => self.input.insert('\n'),
+            KeyCode::Char('j') if ctrl => self.input.insert('\n'),
             KeyCode::Enter => self.submit(handle),
             KeyCode::Esc if self.busy => handle.cancel(),
-            KeyCode::BackTab => {
-                if self.busy {
-                    self.note("Wait for the turn to finish before switching modes.");
-                } else {
-                    send(handle, AgentCommand::CycleMode);
-                }
-            }
+            KeyCode::Tab if shift => self.cycle_mode(true, handle),
+            KeyCode::Tab => self.cycle_mode(false, handle),
+            KeyCode::BackTab => self.cycle_mode(true, handle),
+            // Cmd+Backspace arrives as Ctrl+U in most macOS terminals.
+            KeyCode::Char('u') if ctrl => self.input.delete_to_line_start(),
+            KeyCode::Backspace if cmd => self.input.delete_to_line_start(),
+            KeyCode::Char('w') if ctrl => self.input.delete_word(),
+            KeyCode::Backspace if alt || ctrl => self.input.delete_word(),
+            KeyCode::Char(_) if ctrl || cmd => {}
             KeyCode::Char(c) => self.input.insert(c),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -438,27 +549,39 @@ impl App {
             KeyCode::End => self.input.end(),
             KeyCode::Up if !self.input.text().contains('\n') => self.recall(-1),
             KeyCode::Down if !self.input.text().contains('\n') => self.recall(1),
-            KeyCode::PageUp => self.scroll += 10,
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageUp => self.scroll_by(10),
+            KeyCode::PageDown => self.scroll_by(-10),
             _ => {}
         }
         if self.input.text() != before {
             self.suggest_index = 0;
             self.suggest_hidden = false;
+            // Editing a recalled message makes it a new one.
+            if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                self.sent_pos = None;
+            }
         }
     }
 
     /// Suggestions for the current input (empty when hidden or not a slash command).
     pub fn suggestions(&self) -> Vec<commands::Suggestion> {
-        if self.suggest_hidden || self.modal.is_some() {
+        // While ↑↓ walk through earlier messages, a recalled command shows no suggestions,
+        // so ↑↓ keep walking.
+        if self.suggest_hidden || self.modal.is_some() || self.sent_pos.is_some() {
             return Vec::new();
         }
+        let current = format!("{}/{}", self.provider, self.model);
+        let skills: Vec<(String, String)> = self
+            .skills
+            .iter()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect();
         let ctx = commands::Context {
+            skills: &skills,
             modes: &self.modes,
             current_mode: &self.mode,
             models: &self.known_models,
-            current_model: &self.model,
-            is_cli: self.is_cli(),
+            current_model: &current,
         };
         commands::suggest(self.input.text(), &ctx)
     }
@@ -510,11 +633,28 @@ impl App {
     fn on_modal_key(&mut self, key: KeyEvent, handle: &AgentHandle) {
         let Some(modal) = &mut self.modal else { return };
         match modal {
+            Modal::Session { sessions, selected } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(sessions.len().saturating_sub(1))
+                }
+                KeyCode::Enter => {
+                    if let Some(session) = sessions.get(*selected) {
+                        send(handle, AgentCommand::LoadSession(session.path.clone()));
+                    }
+                    self.modal = None;
+                }
+                _ => {}
+            },
             Modal::Model(picker) => match picker.on_key(key.code) {
                 PickerAction::Cancel => self.modal = None,
                 PickerAction::Chosen(model) => {
                     self.modal = None;
-                    self.switch_model(model, handle);
+                    // `None` (the CLI's default) is offered as `provider/default` here.
+                    if let Some(model) = model {
+                        self.switch_model(&model, handle);
+                    }
                 }
                 PickerAction::None => {}
             },
@@ -524,14 +664,67 @@ impl App {
                 }
             }
             Modal::Approval {
-                allow_always,
+                reply,
+                feedback: Some(input),
+                ..
+            } => {
+                let decision = match key.code {
+                    KeyCode::Esc => {
+                        if let Some(Modal::Approval { feedback, .. }) = &mut self.modal {
+                            *feedback = None;
+                        }
+                        return;
+                    }
+                    KeyCode::Enter
+                        if key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                    {
+                        input.insert('\n');
+                        None
+                    }
+                    KeyCode::Enter if !input.text().trim().is_empty() => {
+                        Some(Approval::Change(input.take().trim().to_owned()))
+                    }
+                    KeyCode::Char(c) => {
+                        input.insert(c);
+                        None
+                    }
+                    KeyCode::Backspace => {
+                        input.backspace();
+                        None
+                    }
+                    KeyCode::Left => {
+                        input.left();
+                        None
+                    }
+                    KeyCode::Right => {
+                        input.right();
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(decision) = decision {
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(decision);
+                    }
+                    self.modal = None;
+                }
+            }
+            Modal::Approval {
+                always,
                 reply,
                 scroll,
+                feedback,
                 ..
             } => {
                 let decision = match key.code {
                     KeyCode::Char('y') => Some(Approval::Yes),
-                    KeyCode::Char('a') if *allow_always => Some(Approval::Always),
+                    KeyCode::Char('a') if always.is_some() => Some(Approval::Always),
+                    KeyCode::Char('c') => {
+                        *feedback = Some(Input::default());
+                        None
+                    }
                     KeyCode::Char('n') | KeyCode::Esc => Some(Approval::No),
                     KeyCode::Down | KeyCode::Char('j') => {
                         *scroll += 1;
@@ -639,7 +832,23 @@ impl App {
         let mut words = command.split_whitespace();
         let name = commands::canonical(words.next().unwrap_or(""));
         let arg = words.next();
-        let idle_only = matches!(name, "mode" | "plan" | "build" | "clear" | "diff" | "model");
+        // Everything after the command name, for commands that take free text.
+        let rest = command
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim());
+        let idle_only = matches!(
+            name,
+            "mode"
+                | "plan"
+                | "build"
+                | "clear"
+                | "diff"
+                | "model"
+                | "session"
+                | "scaffold"
+                | "skill"
+        );
         if idle_only && self.busy {
             self.note("Wait for the turn to finish (or Esc to cancel) first.");
             return;
@@ -660,8 +869,30 @@ impl App {
             ("review", _) => self.note("Usage: /review user | /review subagent"),
             ("diff", _) => send(handle, AgentCommand::ShowDiff),
             ("model", None) => self.open_model_picker(),
-            ("model", Some("default")) if self.is_cli() => self.switch_model(None, handle),
-            ("model", Some(model)) => self.switch_model(Some(model.to_owned()), handle),
+            ("model", Some(model)) => self.switch_model(model, handle),
+            ("session", _) => self.open_sessions(),
+            ("skill", None) => {
+                let names: Vec<&str> = self.skills.iter().map(|s| s.name.as_str()).collect();
+                if names.is_empty() {
+                    self.note("No skills: add them to .agents/skills/<name>/SKILL.md.");
+                } else {
+                    self.note(&format!(
+                        "Skills: {}. Use /skill <name> [request].",
+                        names.join(", ")
+                    ));
+                }
+            }
+            ("skill", Some(skill)) => {
+                let request = rest.strip_prefix(skill).unwrap_or("").trim().to_owned();
+                self.use_skill(skill, &request, handle);
+            }
+            ("scaffold", _) => {
+                self.items.push(Item::User("/scaffold".into()));
+                self.scroll = 0;
+                self.busy = true;
+                send(handle, AgentCommand::Scaffold);
+            }
+            ("sidebar", _) => self.sidebar = !self.sidebar,
             ("clear", _) => {
                 self.items.clear();
                 self.usage = Usage::default();
@@ -674,11 +905,9 @@ impl App {
     fn on_ui(&mut self, event: UiEvent) {
         match event {
             UiEvent::Models(models, error) => {
-                for model in &models {
-                    if !self.known_models.contains(model) {
-                        self.known_models.push(model.clone());
-                    }
-                }
+                self.known_models = models.clone();
+                self.models_loaded = true;
+                self.models_error = error.clone();
                 if let Some(Modal::Model(picker)) = &mut self.modal {
                     picker.set_models(models, error);
                 }
@@ -686,37 +915,104 @@ impl App {
         }
     }
 
-    fn spec(&self) -> Option<&ProviderSpec> {
-        self.providers.iter().find(|p| p.id == self.provider)
+    /// List every usable provider's models in the background. The current provider's
+    /// come first.
+    fn load_models(&self) {
+        let mut specs = self.providers.clone();
+        specs.sort_by_key(|p| p.id != self.provider);
+        let current = self.provider.clone();
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            let lists = futures_util::future::join_all(specs.iter().map(provider_models)).await;
+            let mut models = Vec::new();
+            let mut error = None;
+            for (spec, (list, e)) in specs.iter().zip(lists) {
+                if spec.id == current {
+                    error = e.map(|e| e.to_string());
+                }
+                models.extend(list.into_iter().map(|m| format!("{}/{m}", spec.id)));
+            }
+            let _ = ui.send(UiEvent::Models(models, error));
+        });
     }
 
-    pub fn is_cli(&self) -> bool {
-        self.spec()
-            .is_some_and(|s| matches!(s.backend, SpecBackend::Cli(_)))
-    }
-
-    /// Open the picker and list the provider's models in the background.
+    /// Open the picker over every usable provider's models.
     fn open_model_picker(&mut self) {
-        let Some(spec) = self.spec().cloned() else {
+        let current = format!("{}/{}", self.provider, self.model);
+        let mut picker = ModelPicker::new(false, Some(&current));
+        if self.models_loaded {
+            picker.set_models(self.known_models.clone(), self.models_error.clone());
+        } else {
+            self.load_models();
+        }
+        self.modal = Some(Modal::Model(picker));
+    }
+
+    /// Send the skill's instructions as a user message, with the user's request.
+    fn use_skill(&mut self, name: &str, request: &str, handle: &AgentHandle) {
+        let Some(skill) = self.skills.iter().find(|s| s.name == name) else {
+            self.note(&format!("No skill named `{name}`. /skill lists them."));
+            return;
+        };
+        let body = match skill.body() {
+            Ok(body) => body,
+            Err(e) => {
+                self.items.push(Item::Error(format!(
+                    "cannot read {}: {e}",
+                    skill.path.display()
+                )));
+                return;
+            }
+        };
+        let mut message = format!("Use the `{name}` skill:\n\n<skill>\n{body}\n</skill>");
+        if !request.is_empty() {
+            message.push_str(&format!("\n\n{request}"));
+        }
+        let shown = if request.is_empty() {
+            format!("/skill {name}")
+        } else {
+            format!("/skill {name} {request}")
+        };
+        self.items.push(Item::User(shown));
+        self.scroll = 0;
+        self.busy = true;
+        send(handle, AgentCommand::Send(message));
+    }
+
+    fn open_sessions(&mut self) {
+        let Some(dir) = &self.data_dir else {
+            self.note("Conversations are not saved: no data directory.");
+            return;
+        };
+        match cradle_core::session::list(dir, &self.root) {
+            Ok(sessions) if sessions.is_empty() => {
+                self.note("No saved conversations in this project yet.")
+            }
+            Ok(sessions) => {
+                self.modal = Some(Modal::Session {
+                    sessions,
+                    selected: 0,
+                })
+            }
+            Err(e) => self
+                .items
+                .push(Item::Error(format!("cannot list conversations: {e}"))),
+        }
+    }
+
+    /// Switch to `provider/model` (or a model on the current provider) and save it as the
+    /// default. `default` on a CLI provider means the CLI's own default.
+    fn switch_model(&mut self, choice: &str, handle: &AgentHandle) {
+        let (id, model) = match choice.split_once('/') {
+            Some((id, model)) if self.providers.iter().any(|p| p.id == id) => (id, model),
+            _ => (self.provider.as_str(), choice),
+        };
+        let Some(spec) = self.providers.iter().find(|p| p.id == id).cloned() else {
             self.note("The current provider is not in the provider list.");
             return;
         };
         let is_cli = matches!(spec.backend, SpecBackend::Cli(_));
-        let current = (!(is_cli && self.model == "default")).then_some(self.model.as_str());
-        self.modal = Some(Modal::Model(ModelPicker::new(is_cli, current)));
-        let ui = self.ui.clone();
-        tokio::spawn(async move {
-            let (models, error) = available_models(&spec).await;
-            let _ = ui.send(UiEvent::Models(models, error.map(|e| e.to_string())));
-        });
-    }
-
-    /// Switch to `model` on the current provider and save it as the default.
-    fn switch_model(&mut self, model: Option<String>, handle: &AgentHandle) {
-        let Some(spec) = self.spec().cloned() else {
-            self.note("The current provider is not in the provider list.");
-            return;
-        };
+        let model = (!(is_cli && model == "default")).then(|| model.to_owned());
         match Backend::new(&spec, model.as_deref()) {
             Ok(backend) => {
                 send(handle, AgentCommand::SetBackend(Box::new(backend)));
@@ -765,6 +1061,79 @@ impl App {
 
 fn send(handle: &AgentHandle, command: AgentCommand) {
     let _ = handle.commands.send(command);
+}
+
+/// A provider's configured models; CLI providers also offer their own `default`.
+fn configured_models(spec: &ProviderSpec) -> impl Iterator<Item = String> + '_ {
+    let (default, models) = match &spec.backend {
+        SpecBackend::Http(h) => (None, &h.models),
+        SpecBackend::Cli(c) => (Some("default".to_owned()), &c.models),
+    };
+    default
+        .into_iter()
+        .chain(models.iter().cloned())
+        .map(move |m| format!("{}/{m}", spec.id))
+}
+
+/// The models `spec` offers, or none if it can't be used (no key, CLI not installed).
+async fn provider_models(spec: &ProviderSpec) -> (Vec<String>, Option<BackendError>) {
+    match &spec.backend {
+        SpecBackend::Cli(cli) => {
+            let binary = cli.binary.clone();
+            let installed = tokio::task::spawn_blocking(move || {
+                cradle_backends::cli::installed_version(&binary)
+            })
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+            if !installed {
+                return (Vec::new(), None);
+            }
+            let mut models = vec!["default".to_owned()];
+            models.extend(cli.models.iter().cloned());
+            (models, None)
+        }
+        SpecBackend::Http(_) => match available_models(spec).await {
+            (_, Some(e @ BackendError::MissingKey(_))) => (Vec::new(), Some(e)),
+            result => result,
+        },
+    }
+}
+
+/// Transcript items for a saved conversation: what was said, and which tools ran.
+fn history_items(history: &[Message]) -> Vec<Item> {
+    let mut items = Vec::new();
+    for message in history {
+        for block in &message.content {
+            match (message.role, block) {
+                (Role::User, Block::Text { text }) if !text.trim().is_empty() => {
+                    items.push(Item::User(text.clone()))
+                }
+                (Role::Assistant, Block::Text { text }) if !text.trim().is_empty() => {
+                    items.push(Item::Assistant(text.clone()))
+                }
+                (
+                    Role::Assistant,
+                    Block::ToolUse {
+                        id, name, input, ..
+                    },
+                ) => {
+                    let summary = cradle_tools::parse_call(name, input)
+                        .map(|c| c.summary())
+                        .unwrap_or_else(|_| name.clone());
+                    items.push(Item::Tool {
+                        id: id.clone(),
+                        summary,
+                        state: ToolState::Ok,
+                        preview: String::new(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    items
 }
 
 #[cfg(test)]
@@ -902,10 +1271,88 @@ mod tests {
 
         type_text(&mut app, &handle, "/model ");
         let s = screen(&app);
-        assert!(s.contains("small") && s.contains("large"), "{s}");
+        assert!(
+            s.contains("local/small") && s.contains("local/large"),
+            "{s}"
+        );
         press(&mut app, &handle, KeyCode::Esc);
         assert!(app.suggestions().is_empty(), "Esc hides the popup");
         assert!(!screen(&app).contains("↑↓ select"));
+    }
+
+    #[tokio::test]
+    async fn history_walks_past_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, handle) = start(dir.path());
+        app.remember("first message");
+        app.remember("/help");
+        app.remember("last message");
+        press(&mut app, &handle, KeyCode::Up);
+        press(&mut app, &handle, KeyCode::Up);
+        assert_eq!(app.input.text(), "/help");
+        assert!(app.suggestions().is_empty());
+        press(&mut app, &handle, KeyCode::Up);
+        assert_eq!(app.input.text(), "first message");
+        press(&mut app, &handle, KeyCode::Down);
+        press(&mut app, &handle, KeyCode::Down);
+        assert_eq!(app.input.text(), "last message");
+    }
+
+    #[tokio::test]
+    async fn tab_and_shift_tab_cycle_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut handle) = start(dir.path());
+        until(&mut app, &mut handle, |a| a.mode == "plan").await;
+        press(&mut app, &handle, KeyCode::Tab);
+        until(&mut app, &mut handle, |a| a.mode == "build").await;
+        press(&mut app, &handle, KeyCode::BackTab);
+        until(&mut app, &mut handle, |a| a.mode == "plan").await;
+    }
+
+    #[tokio::test]
+    async fn sidebar_shows_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _handle) = start(dir.path());
+        app.on_agent(AgentEvent::FilesChanged(vec![FileStat {
+            path: "src/main.rs".into(),
+            added: 12,
+            removed: 3,
+        }]));
+        let s = screen(&app);
+        assert!(
+            s.contains("Changed files (1)") && s.contains("+12 -3"),
+            "{s}"
+        );
+        app.sidebar = false;
+        assert!(!screen(&app).contains("Changed files"));
+    }
+
+    #[tokio::test]
+    async fn approval_can_ask_for_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, handle) = start(dir.path());
+        let (reply, answer) = oneshot::channel();
+        app.on_agent(AgentEvent::Approval(cradle_core::ApprovalRequest {
+            title: "Create a.txt?".into(),
+            body: "+a".into(),
+            note: None,
+            always: Some("allow all file edits this session".into()),
+            reply,
+        }));
+        let s = screen(&app);
+        assert!(
+            s.contains("[a] allow all file edits this session") && s.contains("[c] change"),
+            "{s}"
+        );
+        press(&mut app, &handle, KeyCode::Char('c'));
+        type_text(&mut app, &handle, "name it b.txt");
+        assert!(screen(&app).contains("› name it b.txt"));
+        press(&mut app, &handle, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            answer.await.unwrap(),
+            Approval::Change("name it b.txt".into())
+        );
     }
 
     #[tokio::test]

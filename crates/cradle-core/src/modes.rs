@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use cradle_config::{ClashHandler, Mode, ModeAccess, Modes};
+use cradle_config::{ClashHandler, Mode, ModeAccess, Modes, split_front_matter};
 
 const BUILTIN_PLAN: &str = include_str!("../modes/plan.md");
 const BUILTIN_BUILD: &str = include_str!("../modes/build.md");
@@ -15,7 +15,62 @@ const BUILTIN_BUILD: &str = include_str!("../modes/build.md");
 pub struct ActiveMode {
     pub name: String,
     pub access: ModeAccess,
+    /// From the mode file's front matter (`file_edits: deny | ask | allow`).
+    pub file_edits: FileEdits,
+    /// The instructions, without front matter.
     pub prompt: String,
+}
+
+/// Whether the agent may create and change files in a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEdits {
+    /// Refused without asking.
+    Deny,
+    /// Each change is shown to the user first (they may allow all for the session).
+    Ask,
+    /// Applied without asking. Protected files and `.agents/` docs still ask.
+    Allow,
+}
+
+impl ActiveMode {
+    /// Build a mode from its file's text. Without a `file_edits` setting, read-only modes
+    /// deny edits and full-access modes ask.
+    pub fn parse(name: &str, access: ModeAccess, text: &str) -> io::Result<Self> {
+        let (fields, body) = split_front_matter(text);
+        let file_edits = match fields
+            .get("file_edits")
+            .map(|v| v.to_lowercase())
+            .as_deref()
+        {
+            None => match access {
+                ModeAccess::Read => FileEdits::Deny,
+                ModeAccess::Full => FileEdits::Ask,
+            },
+            Some("deny" | "false" | "no") => FileEdits::Deny,
+            Some("ask") => FileEdits::Ask,
+            Some("allow" | "true" | "yes") => FileEdits::Allow,
+            Some(other) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("mode `{name}`: file_edits must be deny, ask or allow, not `{other}`"),
+                ));
+            }
+        };
+        Ok(ActiveMode {
+            name: name.to_owned(),
+            access,
+            file_edits,
+            prompt: body.to_owned(),
+        })
+    }
+
+    /// What applies to file edits: read-only modes never edit, whatever the file says.
+    pub fn effective_edits(&self) -> FileEdits {
+        match self.access {
+            ModeAccess::Read => FileEdits::Deny,
+            ModeAccess::Full => self.file_edits,
+        }
+    }
 }
 
 /// How to resolve a mode defined both globally and by the project.
@@ -72,32 +127,39 @@ impl ModeSet {
             ),
         ] {
             let global = global_file(global_dir, name);
-            let prompt = match (global, project_mode) {
-                (None, None) => builtin.to_owned(),
-                (Some(g), None) => fs::read_to_string(g)?,
-                (None, Some(p)) => fs::read_to_string(&p.path)?,
-                (Some(g), Some(p)) => match choice {
-                    ClashChoice::Override => fs::read_to_string(&p.path)?,
-                    ClashChoice::Combine => format!(
-                        "{}\n\nProject-specific instructions follow. Where they contradict the \
-                         instructions above, the project instructions win.\n\n{}",
-                        fs::read_to_string(g)?.trim_end(),
-                        fs::read_to_string(&p.path)?
-                    ),
-                },
+            let mode = match (global, project_mode) {
+                (None, None) => ActiveMode::parse(name, access, builtin)?,
+                (Some(g), None) => ActiveMode::parse(name, access, &fs::read_to_string(g)?)?,
+                (None, Some(p)) => ActiveMode::parse(name, access, &fs::read_to_string(&p.path)?)?,
+                (Some(g), Some(p)) => {
+                    let project = ActiveMode::parse(name, access, &fs::read_to_string(&p.path)?)?;
+                    match choice {
+                        ClashChoice::Override => project,
+                        // The project's front matter wins, like its instructions.
+                        ClashChoice::Combine => {
+                            let global = ActiveMode::parse(name, access, &fs::read_to_string(g)?)?;
+                            ActiveMode {
+                                prompt: format!(
+                                    "{}\n\nProject-specific instructions follow. Where they \
+                                     contradict the instructions above, the project \
+                                     instructions win.\n\n{}",
+                                    global.prompt.trim_end(),
+                                    project.prompt
+                                ),
+                                ..project
+                            }
+                        }
+                    }
+                }
             };
-            modes.push(ActiveMode {
-                name: name.to_owned(),
-                access,
-                prompt,
-            });
+            modes.push(mode);
         }
         for Mode { name, path, access } in project.map(|m| m.extra.as_slice()).unwrap_or(&[]) {
-            modes.push(ActiveMode {
-                name: name.clone(),
-                access: *access,
-                prompt: fs::read_to_string(path)?,
-            });
+            modes.push(ActiveMode::parse(
+                name,
+                *access,
+                &fs::read_to_string(path)?,
+            )?);
         }
         Ok(ModeSet { modes })
     }
@@ -132,6 +194,11 @@ impl ModeSet {
     pub fn next_after(&self, name: &str) -> &ActiveMode {
         let i = self.modes.iter().position(|m| m.name == name).unwrap_or(0);
         &self.modes[(i + 1) % self.modes.len()]
+    }
+
+    pub fn prev_before(&self, name: &str) -> &ActiveMode {
+        let i = self.modes.iter().position(|m| m.name == name).unwrap_or(0);
+        &self.modes[(i + self.modes.len() - 1) % self.modes.len()]
     }
 }
 
@@ -192,8 +259,26 @@ mod tests {
         assert_eq!(comb.get("debug").unwrap().access, ModeAccess::Full);
         assert_eq!(
             comb.get("build").unwrap().prompt,
-            BUILTIN_BUILD,
+            split_front_matter(BUILTIN_BUILD).1,
             "no clash without a project build mode"
         );
+        assert_eq!(comb.get("build").unwrap().file_edits, FileEdits::Ask);
+        assert_eq!(comb.get("plan").unwrap().effective_edits(), FileEdits::Deny);
+    }
+
+    #[test]
+    fn front_matter_sets_file_edits() {
+        let m =
+            ActiveMode::parse("x", ModeAccess::Full, "---\nfile_edits: allow\n---\nGo").unwrap();
+        assert_eq!((m.file_edits, m.prompt.as_str()), (FileEdits::Allow, "Go"));
+        let m = ActiveMode::parse("x", ModeAccess::Read, "---\nfile_edits: allow\n---\n").unwrap();
+        assert_eq!(m.effective_edits(), FileEdits::Deny, "read-only wins");
+        assert_eq!(
+            ActiveMode::parse("x", ModeAccess::Full, "Go")
+                .unwrap()
+                .file_edits,
+            FileEdits::Ask
+        );
+        assert!(ActiveMode::parse("x", ModeAccess::Full, "---\nfile_edits: maybe\n---\n").is_err());
     }
 }

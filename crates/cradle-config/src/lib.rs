@@ -9,6 +9,7 @@ mod directory;
 mod error;
 mod modes;
 pub mod paths;
+mod skills;
 pub mod user;
 
 use std::collections::BTreeMap;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 pub use error::ConfigError;
 pub use modes::{ClashHandler, Mode, ModeAccess, Modes};
+pub use skills::{Skill, split_front_matter};
 
 pub const AGENTS_DIR: &str = ".agents";
 pub const AGENTS_TOML: &str = "agents.toml";
@@ -50,6 +52,8 @@ pub struct ProjectConfig {
     pub modes: Modes,
     /// The only commands the agent may run, by name.
     pub commands: BTreeMap<String, String>,
+    /// Skills in `.agents/skills/`.
+    pub skills: Vec<Skill>,
 }
 
 /// The single-document sections. All optional: a project may leave any of them out.
@@ -81,8 +85,8 @@ pub enum EntryBody {
 
 /// Look for `.agents/` and `agents.toml` in `root`.
 ///
-/// `.agents/` only counts as the directory form if it holds something other than `modes/`,
-/// because projects using `agents.toml` keep their mode files in `.agents/modes/` too.
+/// `.agents/` only counts as the directory form if it holds something other than `modes/`
+/// and `skills/`, because projects using `agents.toml` keep those in `.agents/` too.
 pub fn detect(root: &Path) -> Result<Detection, ConfigError> {
     let file = root.join(AGENTS_TOML).is_file();
     let dir = directory::is_directory_form(&root.join(AGENTS_DIR))?;

@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::modes::ClashChoice;
 
 /// A hash over everything in the project config that changes Cradle's behaviour:
-/// the config form, `[commands]`, each mode's access and file content, and the rules.
+/// the config form, `[commands]`, each mode's access and file content, the rules, and
+/// each skill.
 pub fn fingerprint(config: &ProjectConfig) -> io::Result<String> {
     let mut h = Sha256::new();
     let mut field = |label: &str, value: &[u8]| {
@@ -54,6 +55,10 @@ pub fn fingerprint(config: &ProjectConfig) -> io::Result<String> {
         "rules",
         config.docs.rules.as_deref().unwrap_or("").as_bytes(),
     );
+    for skill in &config.skills {
+        field("skill", skill.name.as_bytes());
+        field("content", &fs::read(&skill.path)?);
+    }
     Ok(hex::encode(h.finalize()))
 }
 

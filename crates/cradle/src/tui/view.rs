@@ -15,27 +15,41 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const MAX_INPUT_LINES: usize = 8;
 const MAX_DIFF_LINES: usize = 40;
 const MAX_THINKING_LINES: usize = 6;
+const SIDEBAR_WIDTH: u16 = 34;
+/// Narrower terminals hide the sidebar.
+const SIDEBAR_MIN_TERMINAL: u16 = 90;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let input_width = area.width.saturating_sub(2) as usize;
+    let show_sidebar = app.sidebar && area.width >= SIDEBAR_MIN_TERMINAL;
+    let [header, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    let (main, sidebar) = if show_sidebar {
+        let [main, sidebar] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)]).areas(rest);
+        (main, Some(sidebar))
+    } else {
+        (rest, None)
+    };
+
+    let input_width = main.width.saturating_sub(2) as usize;
     let (input_lines, cursor) = app.input.layout(input_width);
     let input_height = input_lines.len().clamp(1, MAX_INPUT_LINES) as u16 + 2;
-
-    let [header, body, input, footer] = Layout::vertical([
-        Constraint::Length(1),
+    let [body, input, footer] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(input_height),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(main);
 
-    draw_header(frame, header, app);
+    draw_header(frame, header, app, !show_sidebar);
     draw_transcript(frame, body, app);
     draw_input(frame, input, app, &input_lines, cursor);
+    if let Some(sidebar) = sidebar {
+        draw_sidebar(frame, sidebar, app);
+    }
     frame.render_widget(
         Paragraph::new(
-            " Enter send · Alt+Enter newline · / commands · Shift+Tab mode · Esc cancel · PgUp/PgDn scroll",
+            " Enter send · Shift+Enter newline · / commands · Tab mode · Esc cancel · wheel/PgUp scroll",
         )
         .style(dim()),
         footer,
@@ -112,7 +126,103 @@ fn draw_suggestions(
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+/// Files changed this session and token usage.
+fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::new()
+        .borders(ratatui::widgets::Borders::LEFT)
+        .border_style(dim())
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    let width = block.inner(area).width as usize;
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::styled(
+        format!("Changed files ({})", app.files.len()),
+        bold,
+    )];
+    if app.files.is_empty() {
+        lines.push(Line::styled("none yet", dim()));
+    }
+    let (mut added, mut removed) = (0, 0);
+    for file in &app.files {
+        added += file.added;
+        removed += file.removed;
+        let counts = format!(" +{} -{}", file.added, file.removed);
+        let path = truncate_left(&file.path, width.saturating_sub(counts.len()));
+        let pad = width.saturating_sub(super::text::display_width(&path) + counts.len());
+        lines.push(Line::from(vec![
+            Span::raw(format!("{path}{}", " ".repeat(pad))),
+            Span::styled(format!(" +{}", file.added), Style::new().fg(Color::Green)),
+            Span::styled(format!(" -{}", file.removed), Style::new().fg(Color::Red)),
+        ]));
+    }
+    if app.files.len() > 1 {
+        lines.push(Line::from(vec![
+            Span::styled("total ", dim()),
+            Span::styled(format!("+{added}"), Style::new().fg(Color::Green)),
+            Span::styled(format!(" -{removed}"), Style::new().fg(Color::Red)),
+        ]));
+    }
+
+    let u = &app.usage;
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Usage", bold));
+    for (label, value) in [
+        ("input", u.input_tokens),
+        ("output", u.output_tokens),
+        ("cache read", u.cache_read_tokens),
+        ("cache write", u.cache_write_tokens),
+    ] {
+        let value = tokens(value);
+        let pad = width.saturating_sub(label.len() + value.len());
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label}{}", " ".repeat(pad)), dim()),
+            Span::raw(value),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// `12345` as `12.3k`.
+fn tokens(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+/// The end of `text` within `width` columns, with `…` in front if cut.
+fn truncate_left(text: &str, width: usize) -> String {
+    if super::text::display_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut used = 1;
+    for c in text.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    std::iter::once('…').chain(out.into_iter().rev()).collect()
+}
+
+/// How long ago `secs` (since the Unix epoch) was.
+fn ago(secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match now.saturating_sub(secs) {
+        d if d < 60 => "just now".to_owned(),
+        d if d < 3600 => format!("{}m ago", d / 60),
+        d if d < 86_400 => format!("{}h ago", d / 3600),
+        d => format!("{}d ago", d / 86_400),
+    }
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, app: &App, show_tokens: bool) {
     let mode_style = if app.read_only {
         Style::new().fg(Color::Black).bg(Color::Cyan)
     } else {
@@ -128,7 +238,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ReviewPolicy::Subagent => "commands: reviewer, then you",
     };
     let u = &app.usage;
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " cradle ",
             Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
@@ -136,14 +246,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(format!(" {}/{} ", app.provider, app.model)),
         Span::styled(mode, mode_style.add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {review}"), dim()),
-        Span::styled(
+    ];
+    if show_tokens {
+        spans.push(Span::styled(
             format!(
                 "  tokens in {} out {} cached {}",
                 u.input_tokens, u.output_tokens, u.cache_read_tokens
             ),
             dim(),
-        ),
-    ]);
+        ));
+    }
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -164,6 +277,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
 
     let height = area.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
+    app.max_scroll.set(max_scroll);
     let scroll = app.scroll.min(max_scroll);
     let start = lines.len().saturating_sub(height + scroll);
     let end = (start + height).min(lines.len());
@@ -362,8 +476,9 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
             title,
             body,
             note,
-            allow_always,
+            always,
             scroll,
+            feedback,
             ..
         } => {
             let mut lines: Vec<Line> = Vec::new();
@@ -378,10 +493,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                     lines.push(Line::styled(l, diff_style(raw)));
                 }
             }
-            let keys = if *allow_always {
-                " [y] yes · [a] always this session · [n] no · ↑↓ scroll "
-            } else {
-                " [y] yes · [n] no · ↑↓ scroll "
+            let keys = match (feedback, always) {
+                (Some(_), _) => " Enter send · Shift+Enter new line · Esc back ".to_owned(),
+                (None, Some(always)) => format!(
+                    " [y] allow once · [a] {always} · [c] change something · [n] no · ↑↓ scroll "
+                ),
+                (None, None) => {
+                    " [y] allow once · [c] change something · [n] no · ↑↓ scroll ".to_owned()
+                }
             };
             let block = Block::bordered()
                 .title(format!(" {title} "))
@@ -389,15 +508,52 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                     keys,
                     Style::new().add_modifier(Modifier::BOLD),
                 ))
-                .border_style(Style::new().fg(Color::Yellow));
-            let visible = rect.height.saturating_sub(2) as usize;
+                .border_style(Style::new().fg(Color::Yellow))
+                .padding(ratatui::widgets::Padding::horizontal(1));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+
+            // While typing feedback, it takes the bottom of the dialog.
+            let feedback_lines: Vec<Line> = match feedback {
+                Some(input) => {
+                    let mut out = vec![Line::styled(
+                        "What should the agent do instead?",
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )];
+                    let (text, _) = input.layout(inner.width.saturating_sub(2) as usize);
+                    let last = text.len() - 1;
+                    for (i, l) in text.into_iter().enumerate() {
+                        let mut spans = vec![
+                            Span::styled("› ", Style::new().fg(Color::Cyan)),
+                            Span::raw(l),
+                        ];
+                        if i == last {
+                            spans.push(Span::styled("▏", Style::new().fg(Color::Cyan)));
+                        }
+                        out.push(Line::from(spans));
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
+            let reserved = (feedback_lines.len() as u16 + 1).min(inner.height)
+                * u16::from(!feedback_lines.is_empty());
+            let body_area = Rect {
+                height: inner.height - reserved,
+                ..inner
+            };
+            let visible = body_area.height as usize;
             let scroll = (*scroll).min(lines.len().saturating_sub(visible));
             let lines: Vec<Line> = lines.into_iter().skip(scroll).collect();
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .block(block.padding(ratatui::widgets::Padding::horizontal(1))),
-                rect,
-            );
+            frame.render_widget(Paragraph::new(lines), body_area);
+            if reserved > 0 {
+                let area = Rect {
+                    y: inner.y + inner.height - reserved + 1,
+                    height: reserved - 1,
+                    ..inner
+                };
+                frame.render_widget(Paragraph::new(feedback_lines), area);
+            }
         }
         Modal::Question {
             question,
@@ -446,15 +602,52 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                 rect,
             );
         }
+        Modal::Session { sessions, selected } => {
+            let rows = (rect.height as usize).saturating_sub(2).max(1);
+            let first = (selected + 1).saturating_sub(rows);
+            let lines: Vec<Line> = sessions
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(rows)
+                .map(|(i, s)| {
+                    let meta = format!("{:>9} · {:>3} msgs  ", ago(s.started), s.messages);
+                    let title = super::text::wrap(&s.title, inner_width.saturating_sub(meta.len()))
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default();
+                    let style = if i == *selected {
+                        Style::new().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::new()
+                    };
+                    Line::from(vec![
+                        Span::styled(meta, if i == *selected { style } else { dim() }),
+                        Span::styled(title, style),
+                    ])
+                })
+                .collect();
+            let block = Block::bordered()
+                .title(" Resume a conversation ")
+                .title_bottom(" ↑↓ choose · Enter resume · Esc cancel ")
+                .border_style(Style::new().fg(Color::Cyan))
+                .padding(ratatui::widgets::Padding::horizontal(1));
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
         Modal::Help => {
             let keys = [
                 ("Enter", "send the message"),
-                ("Alt+Enter", "new line"),
+                ("Shift+Enter", "new line (also Alt+Enter, Ctrl+J)"),
                 ("/", "commands, with suggestions (Tab completes)"),
-                ("Shift+Tab", "cycle modes (plan is read-only)"),
+                (
+                    "Tab / Shift+Tab",
+                    "cycle modes forward / back (plan is read-only)",
+                ),
                 ("Esc", "cancel the current turn"),
-                ("PgUp / PgDn", "scroll the transcript"),
+                ("Wheel, PgUp / PgDn", "scroll the transcript"),
                 ("↑ / ↓", "previous messages"),
+                ("Cmd+⌫ / Ctrl+U", "delete to the start of the line"),
+                ("Alt+⌫ / Ctrl+W", "delete the previous word"),
                 ("Ctrl+C", "clear input / cancel / quit (twice)"),
             ];
             let mut help: Vec<(String, &str)> =

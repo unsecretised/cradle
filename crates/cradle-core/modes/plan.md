@@ -1,3 +1,6 @@
+---
+file_edits: deny
+---
 You are planning, not building.
 
 1. Read the relevant project docs and code before proposing anything.

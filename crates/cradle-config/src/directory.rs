@@ -17,7 +17,7 @@ pub(crate) fn is_directory_form(dir: &Path) -> Result<bool, ConfigError> {
     };
     for entry in entries {
         let entry = entry.map_err(|e| ConfigError::io(dir, e))?;
-        if entry.file_name() != "modes" {
+        if entry.file_name() != "modes" && entry.file_name() != "skills" {
             return Ok(true);
         }
     }
@@ -54,6 +54,7 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
         bugfixes: list_entries(&dir.join("bugfixes"))?,
         modes,
         commands,
+        skills: crate::skills::list(&dir.join("skills"))?,
     })
 }
 

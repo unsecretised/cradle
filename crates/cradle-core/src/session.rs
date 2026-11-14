@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cradle_backends::Message;
+use cradle_backends::{Message, Role};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
@@ -44,23 +44,74 @@ impl SessionLog {
     }
 }
 
+/// A saved transcript, for choosing one to resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    /// Seconds since the Unix epoch when the transcript was started.
+    pub started: u64,
+    /// The first thing the user said.
+    pub title: String,
+    pub messages: usize,
+}
+
 /// The most recent transcript for `root`, with its messages.
 pub fn latest(data_dir: &Path, root: &Path) -> io::Result<Option<(PathBuf, Vec<Message>)>> {
+    let mut files = transcripts(data_dir, root)?;
+    let Some(path) = files.pop() else {
+        return Ok(None);
+    };
+    Ok(Some((path.clone(), read(&path)?)))
+}
+
+/// Non-empty transcripts for `root`, newest first. Unreadable ones are skipped.
+pub fn list(data_dir: &Path, root: &Path) -> io::Result<Vec<SessionInfo>> {
+    let mut out = Vec::new();
+    for path in transcripts(data_dir, root)?.into_iter().rev() {
+        let Ok(messages) = read(&path) else { continue };
+        if messages.is_empty() {
+            continue;
+        }
+        let title = messages
+            .iter()
+            .find(|m| m.role == Role::User && !m.text().trim().is_empty())
+            .map(|m| m.text().trim().lines().next().unwrap_or("").to_owned())
+            .unwrap_or_default();
+        let started = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split('-').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        out.push(SessionInfo {
+            path,
+            started,
+            title,
+            messages: messages.len(),
+        });
+    }
+    Ok(out)
+}
+
+/// Transcript files for `root`, oldest first.
+fn transcripts(data_dir: &Path, root: &Path) -> io::Result<Vec<PathBuf>> {
     let dir = project_dir(data_dir, root);
     let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
             .collect(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     files.sort();
-    let Some(path) = files.pop() else {
-        return Ok(None);
-    };
+    Ok(files)
+}
+
+/// The messages in a transcript.
+pub fn read(path: &Path) -> io::Result<Vec<Message>> {
     let mut messages = Vec::new();
-    for line in BufReader::new(File::open(&path)?).lines() {
+    for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -72,7 +123,7 @@ pub fn latest(data_dir: &Path, root: &Path) -> io::Result<Option<(PathBuf, Vec<M
             )
         })?);
     }
-    Ok(Some((path, messages)))
+    Ok(messages)
 }
 
 fn project_dir(data_dir: &Path, root: &Path) -> PathBuf {
@@ -101,5 +152,25 @@ mod tests {
             messages,
             vec![Message::user("hello"), Message::system("mode")]
         );
+    }
+
+    #[test]
+    fn lists_non_empty_sessions_newest_first() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = project_dir(data.path(), root.path());
+        fs::create_dir_all(&dir).unwrap();
+        let mut old = SessionLog::open(dir.join("000000000001-1.jsonl")).unwrap();
+        old.append(&Message::system("mode")).unwrap();
+        old.append(&Message::user("first\nmore")).unwrap();
+        let mut new = SessionLog::open(dir.join("000000000002-1.jsonl")).unwrap();
+        new.append(&Message::user("second")).unwrap();
+        SessionLog::open(dir.join("000000000003-1.jsonl")).unwrap();
+
+        let sessions = list(data.path(), root.path()).unwrap();
+        let titles: Vec<&str> = sessions.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["second", "first"], "empty transcripts are skipped");
+        assert_eq!(sessions[1].started, 1);
+        assert_eq!(sessions[1].messages, 2);
     }
 }

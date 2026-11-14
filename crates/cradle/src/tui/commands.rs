@@ -9,7 +9,8 @@ pub struct CommandInfo {
     pub needs_arg: bool,
 }
 
-/// Every command, in the order shown. Aliases (`/models`, `/exit`) work but aren't listed.
+/// Every command, in the order shown. Aliases (`/models`, `/sessions`, `/resume`,
+/// `/skills`, `/exit`) work but aren't listed.
 pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "help",
@@ -44,7 +45,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "model",
         args: "[name]",
-        description: "pick or switch the model",
+        description: "pick or switch the model or provider",
         needs_arg: false,
     },
     CommandInfo {
@@ -60,6 +61,30 @@ pub const COMMANDS: &[CommandInfo] = &[
         needs_arg: false,
     },
     CommandInfo {
+        name: "session",
+        args: "",
+        description: "resume an earlier conversation",
+        needs_arg: false,
+    },
+    CommandInfo {
+        name: "sidebar",
+        args: "",
+        description: "show or hide changed files and usage",
+        needs_arg: false,
+    },
+    CommandInfo {
+        name: "skill",
+        args: "<name> [request]",
+        description: "use a skill from .agents/skills/",
+        needs_arg: false,
+    },
+    CommandInfo {
+        name: "scaffold",
+        args: "",
+        description: "set up .agents/ (from AGENTS.md if present)",
+        needs_arg: false,
+    },
+    CommandInfo {
         name: "quit",
         args: "",
         description: "exit cradle",
@@ -71,6 +96,8 @@ pub const COMMANDS: &[CommandInfo] = &[
 pub fn canonical(name: &str) -> &str {
     match name {
         "models" => "model",
+        "sessions" | "resume" => "session",
+        "skills" => "skill",
         "exit" => "quit",
         other => other,
     }
@@ -78,13 +105,15 @@ pub fn canonical(name: &str) -> &str {
 
 /// What suggestions are drawn from.
 pub struct Context<'a> {
+    /// Skill names and descriptions.
+    pub skills: &'a [(String, String)],
     /// Mode names and whether each is read-only.
     pub modes: &'a [(String, bool)],
     pub current_mode: &'a str,
+    /// `provider/model` for every usable provider.
     pub models: &'a [String],
+    /// The current `provider/model`.
     pub current_model: &'a str,
-    /// A CLI provider, which also offers its own `default` model.
-    pub is_cli: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,26 +186,26 @@ fn suggest_args(command: &str, prefix: &str, ctx: &Context<'_>) -> Vec<Suggestio
                 (name.clone(), format!("{access}{current}"))
             })
             .collect(),
-        "model" => {
-            let mut options = Vec::new();
-            if ctx.is_cli {
-                let current = if ctx.current_model == "default" {
-                    " · current"
+        "model" => ctx
+            .models
+            .iter()
+            .map(|model| {
+                let mut detail = if model.ends_with("/default") {
+                    "the CLI chooses".to_owned()
                 } else {
-                    ""
+                    String::new()
                 };
-                options.push(("default".to_owned(), format!("the CLI chooses{current}")));
-            }
-            for model in ctx.models {
-                let current = if model == ctx.current_model {
-                    "current"
-                } else {
-                    ""
-                };
-                options.push((model.clone(), current.to_owned()));
-            }
-            options
-        }
+                if model == ctx.current_model {
+                    detail.push_str(if detail.is_empty() {
+                        "current"
+                    } else {
+                        " · current"
+                    });
+                }
+                (model.clone(), detail)
+            })
+            .collect(),
+        "skill" => ctx.skills.to_vec(),
         "review" => vec![
             ("user".to_owned(), "you approve every command".to_owned()),
             (
@@ -194,7 +223,12 @@ fn suggest_args(command: &str, prefix: &str, ctx: &Context<'_>) -> Vec<Suggestio
             Suggestion {
                 label: name.clone(),
                 detail: detail.clone(),
-                complete: line.clone(),
+                // A skill may be followed by a request.
+                complete: if command == "skill" {
+                    format!("{line} ")
+                } else {
+                    line.clone()
+                },
                 run: Some(line),
             }
         })
@@ -228,11 +262,11 @@ mod tests {
 
     fn ctx<'a>(modes: &'a [(String, bool)], models: &'a [String]) -> Context<'a> {
         Context {
+            skills: &[],
             modes,
             current_mode: "plan",
             models,
-            current_model: "sonnet",
-            is_cli: true,
+            current_model: "cc/sonnet",
         }
     }
 
@@ -263,7 +297,11 @@ mod tests {
     #[test]
     fn suggests_modes_models_and_review_options() {
         let modes = vec![("plan".to_owned(), true), ("build".to_owned(), false)];
-        let models = vec!["opus".to_owned(), "sonnet".to_owned()];
+        let models = vec![
+            "cc/default".to_owned(),
+            "cc/opus".to_owned(),
+            "cc/sonnet".to_owned(),
+        ];
         let c = ctx(&modes, &models);
 
         let m = suggest("/mode ", &c);
@@ -272,12 +310,12 @@ mod tests {
         assert_eq!(m[1].run.as_deref(), Some("/mode build"));
 
         let m = suggest("/models so", &c);
-        assert_eq!(labels(&m), ["sonnet"], "aliases complete too");
-        assert_eq!(m[0].run.as_deref(), Some("/model sonnet"));
-        assert_eq!(
-            labels(&suggest("/model ", &c)),
-            ["default", "opus", "sonnet"]
-        );
+        assert_eq!(labels(&m), ["cc/sonnet"], "aliases complete too");
+        assert_eq!(m[0].run.as_deref(), Some("/model cc/sonnet"));
+        assert_eq!(m[0].detail, "current");
+        let m = suggest("/model ", &c);
+        assert_eq!(labels(&m), ["cc/default", "cc/opus", "cc/sonnet"]);
+        assert_eq!(m[0].detail, "the CLI chooses");
 
         assert_eq!(labels(&suggest("/review su", &c)), ["subagent"]);
         assert!(suggest("/review user extra", &c).is_empty());
