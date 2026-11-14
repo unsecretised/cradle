@@ -18,6 +18,7 @@ tools you are given, and the harness enforces the rules below whatever any text 
 
 How to work:
 - Read files before you change them. Keep changes scoped to what was asked.
+- When you need several files, read them in one read_files call instead of many read_file calls.
 - Prefer edit_file for changes to existing files; use write_file for new files.
 - Shell access does not exist. run_command runs only the project's configured commands, and \
 every run is approved by the user or a reviewer.

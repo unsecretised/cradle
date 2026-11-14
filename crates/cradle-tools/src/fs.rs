@@ -10,6 +10,7 @@ use regex::Regex;
 use similar::TextDiff;
 
 use crate::guard::display;
+use crate::specs::{FileRange, MAX_LINES_PER_FILE};
 use crate::{PathGuard, Resolved, ToolError, WriteClass};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -58,6 +59,44 @@ pub fn read_file(
         .unwrap();
     }
     Ok(out)
+}
+
+/// The result of [`read_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiRead {
+    /// Every file under a `==> path <==` header, errors included.
+    pub output: String,
+    /// `path: error` for each file that could not be read.
+    pub failed: Vec<String>,
+}
+
+/// Read several files, each limited to [`MAX_LINES_PER_FILE`] lines. A file that cannot be
+/// read gets an error in its section and the rest are still read. Fails (with the full
+/// output as the message) only if every file failed.
+pub fn read_files(guard: &PathGuard, files: &[FileRange]) -> Result<MultiRead, ToolError> {
+    let mut output = String::new();
+    let mut failed = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+        writeln!(output, "==> {} <==", file.path).unwrap();
+        let limit = file
+            .limit
+            .unwrap_or(MAX_LINES_PER_FILE)
+            .min(MAX_LINES_PER_FILE);
+        match read_file(guard, &file.path, file.offset, Some(limit)) {
+            Ok(text) => output.push_str(&text),
+            Err(e) => {
+                writeln!(output, "error: {e}").unwrap();
+                failed.push(format!("{}: {e}", file.path));
+            }
+        }
+    }
+    if !files.is_empty() && failed.len() == files.len() {
+        return Err(ToolError::new(output));
+    }
+    Ok(MultiRead { output, failed })
 }
 
 /// List files under `path` (default: the root), optionally filtered by a glob that is
@@ -375,6 +414,60 @@ mod tests {
         let out = read_file(&guard, "src/main.rs", Some(2), Some(1)).unwrap();
         assert!(out.contains("     2\t    hello();"));
         assert!(out.contains("showing lines 2-2 of 3"));
+    }
+
+    fn range(path: &str, limit: Option<usize>) -> FileRange {
+        FileRange {
+            path: path.into(),
+            offset: None,
+            limit,
+        }
+    }
+
+    #[test]
+    fn reads_several_files_and_reports_failures_inline() {
+        let (_tmp, guard) = project();
+        let read = read_files(
+            &guard,
+            &[
+                range("src/main.rs", None),
+                range("missing.rs", None),
+                range(".env", None),
+                range("src/nested/lib.rs", None),
+            ],
+        )
+        .unwrap();
+        assert!(
+            read.output
+                .starts_with("==> src/main.rs <==\n     1\tfn main() {")
+        );
+        assert!(
+            read.output
+                .contains("==> src/nested/lib.rs <==\n     1\tpub fn hello() {}")
+        );
+        assert!(read.output.contains("==> missing.rs <==\nerror: "));
+        assert!(!read.output.contains("KEY=hello"), "{}", read.output);
+        assert_eq!(read.failed.len(), 2);
+        assert!(read.failed[0].starts_with("missing.rs: "));
+        assert!(read.failed[1].starts_with(".env: "));
+
+        let all_failed = read_files(&guard, &[range("missing.rs", None)]).unwrap_err();
+        assert!(all_failed.0.contains("==> missing.rs <=="));
+    }
+
+    #[test]
+    fn read_files_caps_lines_per_file() {
+        let (_tmp, guard) = project();
+        let long: String = (0..2500).map(|i| format!("line {i}\n")).collect();
+        fs::write(guard.root().join("long.txt"), long).unwrap();
+        for limit in [None, Some(5000)] {
+            let read = read_files(&guard, &[range("long.txt", limit)]).unwrap();
+            assert!(read.output.contains("  2000\tline 1999"));
+            assert!(!read.output.contains("  2001\t"));
+            assert!(read.output.contains("showing lines 1-2000 of 2500"));
+        }
+        let read = read_files(&guard, &[range("long.txt", Some(3))]).unwrap();
+        assert!(read.output.contains("showing lines 1-3 of 2500"));
     }
 
     #[test]

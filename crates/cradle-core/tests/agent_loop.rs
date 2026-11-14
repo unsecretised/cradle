@@ -314,6 +314,55 @@ async fn build_mode_asks_before_writing_and_always_allows_the_rest() {
 }
 
 #[tokio::test]
+async fn read_files_returns_every_file_and_reports_failures() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    fs::write(tmp.path().join("a.txt"), "alpha\n").unwrap();
+    fs::write(tmp.path().join("b.txt"), "beta\n").unwrap();
+    let (url, requests) = fake_server(vec![
+        tool_call(
+            "t1",
+            "read_files",
+            json!({"files": [{"path": "a.txt"}, {"path": "nope.txt"}, {"path": "b.txt"}]}),
+        ),
+        tool_call("t2", "read_files", json!({"files": [{"path": "nope.txt"}]})),
+        text("ok"),
+    ])
+    .await;
+    let mut agent = start(&url, tmp.path(), "plan", ReviewPolicy::User);
+
+    agent
+        .commands
+        .send(AgentCommand::Send("read".into()))
+        .unwrap();
+    let mut finished = Vec::new();
+    while let Some(event) = agent.events.recv().await {
+        match event {
+            AgentEvent::ToolFinished { ok, failed, .. } => finished.push((ok, failed)),
+            AgentEvent::TurnFinished => break,
+            _ => {}
+        }
+    }
+
+    let (content, is_error) = tool_result(&requests, 1);
+    assert!(!is_error, "{content}");
+    assert!(
+        content.contains("==> a.txt <==\n     1\talpha"),
+        "{content}"
+    );
+    assert!(content.contains("==> b.txt <==\n     1\tbeta"), "{content}");
+    assert!(content.contains("==> nope.txt <==\nerror: "), "{content}");
+    let (content, is_error) = tool_result(&requests, 2);
+    assert!(is_error, "every file failed: {content}");
+
+    assert_eq!(finished.len(), 2);
+    assert!(finished[0].0);
+    assert_eq!(finished[0].1.len(), 1);
+    assert!(finished[0].1[0].starts_with("nope.txt: "));
+    assert!(!finished[1].0);
+}
+
+#[tokio::test]
 async fn requested_changes_reach_the_model() {
     let tmp = tempfile::tempdir().unwrap();
     project(tmp.path());

@@ -19,7 +19,9 @@ use cradle_backends::{
 use cradle_config::{ModeAccess, ProjectConfig};
 use cradle_mcp::{McpServer, McpTool, ToolReply, ToolRequest};
 use cradle_tools::hygiene::reveal_invisible;
-use cradle_tools::{Access, PathGuard, ToolCall, ToolDefinition, ToolError, WriteClass, command};
+use cradle_tools::{
+    Access, PathGuard, ToolActivity, ToolCall, ToolDefinition, ToolError, WriteClass, command,
+};
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -48,11 +50,16 @@ pub enum AgentEvent {
     ToolStarted {
         id: String,
         summary: String,
+        /// What the call does, for grouping. `None` if the input did not parse.
+        activity: Option<ToolActivity>,
     },
     ToolFinished {
         id: String,
         ok: bool,
         preview: String,
+        /// `item: error` for each part that failed in a call that otherwise worked
+        /// (e.g. one file of a `read_files`).
+        failed: Vec<String>,
     },
     Diff {
         title: String,
@@ -206,6 +213,8 @@ struct Agent {
     scaffolding: bool,
     /// The user allowed every file edit for the rest of the session.
     edits_allowed: bool,
+    /// Parts that failed in the tool call that just ran, for its `ToolFinished`.
+    failed_parts: Vec<String>,
     events: mpsc::UnboundedSender<AgentEvent>,
     cancel: Arc<Notify>,
 }
@@ -261,6 +270,7 @@ impl Agent {
             cli_session: None,
             scaffolding: false,
             edits_allowed: false,
+            failed_parts: Vec::new(),
             events,
             cancel,
         }
@@ -493,11 +503,13 @@ impl Agent {
                         result = self.execute(&id, &call.name, &call.arguments, None) => Some(result),
                         _ = cancel.notified() => None,
                     };
+                    let failed = std::mem::take(&mut self.failed_parts);
                     let Some((content, is_error)) = result else {
                         self.emit(AgentEvent::ToolFinished {
                             id,
                             ok: false,
                             preview: "Cancelled.".into(),
+                            failed,
                         });
                         break None;
                     };
@@ -505,6 +517,7 @@ impl Agent {
                         id,
                         ok: !is_error,
                         preview: preview(&content),
+                        failed,
                     });
                     let _ = call.reply.send(ToolReply { text: content, is_error });
                 }
@@ -629,10 +642,12 @@ impl Agent {
                     cancelled = true;
                     ("Cancelled by the user.".into(), true)
                 });
+                let failed = std::mem::take(&mut self.failed_parts);
                 self.emit(AgentEvent::ToolFinished {
                     id: id.clone(),
                     ok: !is_error,
                     preview: preview(&content),
+                    failed,
                 });
                 results.push(tool_result(id, content, is_error));
             }
@@ -660,12 +675,14 @@ impl Agent {
         input: &Value,
         invalid_json: Option<&str>,
     ) -> (String, bool) {
-        let started = |summary: String| AgentEvent::ToolStarted {
+        self.failed_parts.clear();
+        let started = |summary: String, activity: Option<ToolActivity>| AgentEvent::ToolStarted {
             id: id.to_owned(),
             summary,
+            activity,
         };
         if invalid_json.is_some() {
-            self.emit(started(name.to_owned()));
+            self.emit(started(name.to_owned(), None));
             return (
                 "INVALID_JSON: the tool input was not valid JSON (possibly cut off). Retry \
                  with smaller input."
@@ -676,11 +693,11 @@ impl Agent {
         let call = match cradle_tools::parse_call(name, input) {
             Ok(call) => call,
             Err(e) => {
-                self.emit(started(name.to_owned()));
+                self.emit(started(name.to_owned(), None));
                 return (e, true);
             }
         };
-        self.emit(started(call.summary()));
+        self.emit(started(call.summary(), Some(call.activity())));
 
         let mode = self.modes.get(&self.mode).expect("current mode exists");
         let file_write = matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
@@ -720,6 +737,12 @@ impl Agent {
                 offset,
                 limit,
             } => tfs::read_file(&self.guard, &path, offset, limit).map(reveal),
+            ToolCall::ReadFiles { files } => {
+                let read = tfs::read_files(&self.guard, &files)
+                    .map_err(|e| ToolError::new(reveal(e.0)))?;
+                self.failed_parts = read.failed.into_iter().map(reveal).collect();
+                Ok(reveal(read.output))
+            }
             ToolCall::ListFiles { path, glob } => {
                 tfs::list_files(&self.guard, path.as_deref(), glob.as_deref()).map(reveal)
             }

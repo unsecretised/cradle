@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use super::commands::{COMMANDS, Suggestion};
 use super::text::wrap;
+use super::tools::ToolGroup;
 use super::{App, Item, Modal, ToolState};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -49,7 +50,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(
         Paragraph::new(
-            " Enter send · Shift+Enter newline · / commands · Tab mode · Esc cancel · wheel/PgUp scroll",
+            " Enter send · Shift+Enter newline · / commands · Tab mode · Esc cancel · wheel/PgUp scroll · Ctrl+O tools",
         )
         .style(dim()),
         footer,
@@ -264,16 +265,10 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let width = (area.width as usize).saturating_sub(2).max(10);
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.items {
-        render_item(item, width, app.spinner, &mut lines);
+        render_item(item, width, app.spinner, app.tools_expanded, &mut lines);
         lines.push(Line::raw(""));
     }
-    if app.busy {
-        let spin = SPINNER[app.spinner % SPINNER.len()];
-        lines.push(Line::styled(
-            format!("{spin} working…"),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
+    // While busy, the input box's title shows the spinner and how to cancel.
 
     let height = area.height as usize;
     let max_scroll = lines.len().saturating_sub(height);
@@ -285,7 +280,83 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-fn render_item(item: &Item, width: usize, spinner: usize, out: &mut Vec<Line<'static>>) {
+/// A tool card. A single call shows its exact action (and, unless it is a read, search or
+/// listing that worked, a preview of the result). A group shows counts; expanded, it also
+/// lists each file or pattern, with failures in red.
+fn render_tools(
+    group: &ToolGroup,
+    width: usize,
+    spinner: usize,
+    expanded: bool,
+    out: &mut Vec<Line<'static>>,
+) {
+    let state = group.state();
+    let (mark, color) = match state {
+        ToolState::Running => (SPINNER[spinner % SPINNER.len()], Color::Yellow),
+        ToolState::Ok => ("✓", Color::Green),
+        ToolState::Failed => ("✗", Color::Red),
+    };
+    let single = group.is_single();
+    let mut title = group.title();
+    let failed = group.failed_count();
+    if failed > 0 && !single {
+        title.push_str(&format!(" ({failed} failed)"));
+    }
+    gutter(
+        out,
+        &format!("{mark} "),
+        Style::new().fg(color),
+        &title,
+        Style::new(),
+        width,
+    );
+
+    let inner = width.saturating_sub(2);
+    let red = Style::new().fg(Color::Red);
+    if single {
+        let entry = &group.calls[0];
+        let failed = entry.state == ToolState::Failed;
+        if !entry.preview.is_empty() && (failed || !entry.groups()) {
+            let style = if failed { red } else { dim() };
+            gutter(out, "  │ ", dim(), &entry.preview, style, inner);
+        }
+        return;
+    }
+    if !expanded {
+        return;
+    }
+    for entry in &group.calls {
+        let details = entry
+            .activity
+            .as_ref()
+            .map(|a| a.details.as_slice())
+            .unwrap_or_default();
+        for detail in details {
+            let failure = entry.failed.iter().find(|f| {
+                f.strip_prefix(detail.as_str())
+                    .is_some_and(|rest| rest.starts_with(": "))
+            });
+            match failure {
+                Some(f) => gutter(out, "  │ ✗ ", red, f, red, inner),
+                None if entry.state == ToolState::Failed => {
+                    gutter(out, "  │ ✗ ", red, detail, red, inner)
+                }
+                None => gutter(out, "  │ ", dim(), detail, dim(), inner),
+            }
+        }
+        if entry.state == ToolState::Failed && !entry.preview.is_empty() {
+            gutter(out, "  │   ", dim(), &entry.preview, red, inner);
+        }
+    }
+}
+
+fn render_item(
+    item: &Item,
+    width: usize,
+    spinner: usize,
+    expanded: bool,
+    out: &mut Vec<Line<'static>>,
+) {
     match item {
         Item::User(text) => gutter(
             out,
@@ -311,34 +382,7 @@ fn render_item(item: &Item, width: usize, spinner: usize, out: &mut Vec<Line<'st
                 out.push(Line::styled(format!("{mark}{line}"), style));
             }
         }
-        Item::Tool {
-            summary,
-            state,
-            preview,
-            ..
-        } => {
-            let (mark, color) = match state {
-                ToolState::Running => (SPINNER[spinner % SPINNER.len()], Color::Yellow),
-                ToolState::Ok => ("✓", Color::Green),
-                ToolState::Failed => ("✗", Color::Red),
-            };
-            gutter(
-                out,
-                &format!("{mark} "),
-                Style::new().fg(color),
-                summary,
-                Style::new(),
-                width,
-            );
-            if !preview.is_empty() {
-                let style = if *state == ToolState::Failed {
-                    Style::new().fg(Color::Red)
-                } else {
-                    dim()
-                };
-                gutter(out, "  │ ", dim(), preview, style, width.saturating_sub(2));
-            }
-        }
+        Item::Tools(group) => render_tools(group, width, spinner, expanded, out),
         Item::Diff { title, diff } => {
             out.push(Line::styled(
                 format!("  {title}"),
@@ -645,6 +689,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
                 ),
                 ("Esc", "cancel the current turn"),
                 ("Wheel, PgUp / PgDn", "scroll the transcript"),
+                ("Ctrl+O", "expand / collapse grouped tool calls"),
                 ("↑ / ↓", "previous messages"),
                 ("Cmd+⌫ / Ctrl+U", "delete to the start of the line"),
                 ("Alt+⌫ / Ctrl+W", "delete the previous word"),

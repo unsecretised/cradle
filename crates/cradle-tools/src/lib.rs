@@ -10,7 +10,10 @@ pub mod hygiene;
 pub mod specs;
 
 pub use guard::{GuardError, PathGuard, Resolved, WriteClass};
-pub use specs::{Access, ToolCall, ToolDefinition, definitions, parse_call};
+pub use specs::{
+    Access, ActivityKind, FileRange, ToolActivity, ToolCall, ToolDefinition, definitions,
+    parse_call,
+};
 
 /// A tool failure, reported back to the model as an error result.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

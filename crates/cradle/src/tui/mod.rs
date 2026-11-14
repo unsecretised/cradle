@@ -5,6 +5,7 @@ mod markdown;
 mod onboard;
 mod picker;
 mod text;
+mod tools;
 mod view;
 
 use std::cell::Cell;
@@ -173,12 +174,8 @@ pub(crate) enum Item {
     User(String),
     Assistant(String),
     Thinking(String),
-    Tool {
-        id: String,
-        summary: String,
-        state: ToolState,
-        preview: String,
-    },
+    /// One tool call, or a run of grouped ones.
+    Tools(tools::ToolGroup),
     Diff {
         title: String,
         diff: String,
@@ -192,7 +189,7 @@ pub(crate) enum Item {
     Error(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolState {
     Running,
     Ok,
@@ -236,6 +233,8 @@ pub(crate) struct App {
     pub files: Vec<FileStat>,
     /// Show the sidebar (when the terminal is wide enough).
     pub sidebar: bool,
+    /// Show each file and pattern in grouped tool cards (Ctrl+O).
+    pub tools_expanded: bool,
     pub input: Input,
     pub modal: Option<Modal>,
     pub busy: bool,
@@ -313,6 +312,7 @@ impl App {
             max_scroll: Cell::new(0),
             files: Vec::new(),
             sidebar: true,
+            tools_expanded: false,
             input: Input::default(),
             modal: None,
             busy: false,
@@ -358,28 +358,20 @@ impl App {
                 Some(Item::Thinking(text)) => text.push_str(&t),
                 _ => self.items.push(Item::Thinking(t)),
             },
-            AgentEvent::ToolStarted { id, summary } => self.items.push(Item::Tool {
+            AgentEvent::ToolStarted {
                 id,
                 summary,
-                state: ToolState::Running,
-                preview: String::new(),
-            }),
-            AgentEvent::ToolFinished { id, ok, preview } => {
-                for item in self.items.iter_mut().rev() {
-                    if let Item::Tool {
-                        id: item_id,
-                        state,
-                        preview: p,
-                        ..
-                    } = item
-                        && *item_id == id
-                    {
-                        *state = if ok { ToolState::Ok } else { ToolState::Failed };
-                        *p = preview;
-                        break;
-                    }
-                }
-            }
+                activity,
+            } => tools::push(
+                &mut self.items,
+                tools::ToolEntry::new(id, summary, activity),
+            ),
+            AgentEvent::ToolFinished {
+                id,
+                ok,
+                preview,
+                failed,
+            } => tools::finish(&mut self.items, &id, ok, preview, failed),
             AgentEvent::Diff { title, diff } => self.items.push(Item::Diff { title, diff }),
             AgentEvent::ReviewResult {
                 command,
@@ -538,6 +530,7 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input.delete_to_line_start(),
             KeyCode::Backspace if cmd => self.input.delete_to_line_start(),
             KeyCode::Char('w') if ctrl => self.input.delete_word(),
+            KeyCode::Char('o') if ctrl => self.tools_expanded = !self.tools_expanded,
             KeyCode::Backspace if alt || ctrl => self.input.delete_word(),
             KeyCode::Char(_) if ctrl || cmd => {}
             KeyCode::Char(c) => self.input.insert(c),
@@ -1119,15 +1112,13 @@ fn history_items(history: &[Message]) -> Vec<Item> {
                         id, name, input, ..
                     },
                 ) => {
-                    let summary = cradle_tools::parse_call(name, input)
-                        .map(|c| c.summary())
-                        .unwrap_or_else(|_| name.clone());
-                    items.push(Item::Tool {
-                        id: id.clone(),
-                        summary,
-                        state: ToolState::Ok,
-                        preview: String::new(),
-                    });
+                    let (summary, activity) = match cradle_tools::parse_call(name, input) {
+                        Ok(call) => (call.summary(), Some(call.activity())),
+                        Err(_) => (name.clone(), None),
+                    };
+                    let mut entry = tools::ToolEntry::new(id.clone(), summary, activity);
+                    entry.state = ToolState::Ok;
+                    tools::push(&mut items, entry);
                 }
                 _ => {}
             }
@@ -1353,6 +1344,87 @@ mod tests {
             answer.await.unwrap(),
             Approval::Change("name it b.txt".into())
         );
+    }
+
+    #[tokio::test]
+    async fn grouped_tool_calls_collapse_and_expand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, handle) = start(dir.path());
+        let calls = [
+            (
+                "t1",
+                cradle_tools::ToolCall::ReadFile {
+                    path: "src/alpha.rs".into(),
+                    offset: None,
+                    limit: None,
+                },
+            ),
+            (
+                "t2",
+                cradle_tools::ToolCall::ReadFiles {
+                    files: ["src/beta.rs", "src/gamma.rs"]
+                        .map(|p| cradle_tools::FileRange {
+                            path: p.into(),
+                            offset: None,
+                            limit: None,
+                        })
+                        .to_vec(),
+                },
+            ),
+            (
+                "t3",
+                cradle_tools::ToolCall::Search {
+                    pattern: "needle".into(),
+                    path: None,
+                    glob: None,
+                },
+            ),
+        ];
+        for (id, call) in calls {
+            app.on_agent(AgentEvent::ToolStarted {
+                id: id.into(),
+                summary: call.summary(),
+                activity: Some(call.activity()),
+            });
+        }
+        let failed = vec!["src/gamma.rs: does not exist".to_owned()];
+        for (id, failed) in [("t1", vec![]), ("t2", failed), ("t3", vec![])] {
+            app.on_agent(AgentEvent::ToolFinished {
+                id: id.into(),
+                ok: true,
+                preview: "     1\tsecret contents".into(),
+                failed,
+            });
+        }
+
+        let s = screen(&app);
+        assert!(
+            s.contains("Read 3 files, searched 1 pattern (1 failed)"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("src/beta.rs") && !s.contains("secret contents"),
+            "{s}"
+        );
+
+        app.on_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &handle,
+        );
+        let s = screen(&app);
+        assert!(
+            s.contains("│ src/alpha.rs") && s.contains("│ src/beta.rs"),
+            "{s}"
+        );
+        assert!(s.contains("✗ src/gamma.rs: does not exist"), "{s}");
+        assert!(s.contains("│ /needle/ in ."), "{s}");
+        assert!(!s.contains("secret contents"), "{s}");
+
+        app.on_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &handle,
+        );
+        assert!(!screen(&app).contains("src/alpha.rs"));
     }
 
     #[tokio::test]
