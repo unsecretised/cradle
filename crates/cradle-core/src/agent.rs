@@ -26,7 +26,7 @@ use cradle_mcp::{McpServer, McpTool, ToolReply, ToolRequest};
 use cradle_tools::hygiene::reveal_invisible;
 use cradle_tools::{
     Access, PathGuard, Question, QuestionKind, ToolActivity, ToolCall, ToolDefinition, ToolError,
-    WriteClass, command,
+    VarStore, WriteClass, command, vars,
 };
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -287,6 +287,8 @@ struct Agent {
     edits_allowed: bool,
     /// Parts that failed in the tool call that just ran, for its `ToolFinished`.
     failed_parts: Vec<String>,
+    /// Tool results saved with `save_as` in this conversation.
+    vars: VarStore,
     events: mpsc::UnboundedSender<AgentEvent>,
     cancel: Arc<Notify>,
 }
@@ -358,6 +360,7 @@ impl Agent {
             cli_session: None,
             edits_allowed: false,
             failed_parts: Vec::new(),
+            vars: VarStore::default(),
             events,
             cancel,
         }
@@ -449,6 +452,7 @@ impl Agent {
                 }
                 AgentCommand::Clear => {
                     self.history.clear();
+                    self.vars.clear();
                     self.announced_mode = None;
                     self.cli_session = None;
                     self.reset_mode_reviews();
@@ -468,6 +472,7 @@ impl Agent {
                             ))),
                         }
                         self.history = history;
+                        self.vars.clear();
                         self.announced_mode = None;
                         self.cli_session = None;
                         self.reset_mode_reviews();
@@ -654,6 +659,7 @@ impl Agent {
                 });
         self.tools = tools;
         self.tool_specs = tool_specs;
+        self.vars.clear();
         self.system = prompt::system_prompt(self.guard.root(), project.as_ref());
         self.commands = project
             .as_ref()
@@ -1064,14 +1070,22 @@ impl Agent {
                 true,
             );
         }
-        let call = match cradle_tools::parse_call(name, input) {
-            Ok(call) => call,
+        let parsed = vars::take_save_as(input)
+            .and_then(|(input, save_as)| Ok((cradle_tools::parse_call(name, &input)?, save_as)));
+        let (call, save_as) = match parsed {
+            Ok(parsed) => parsed,
             Err(e) => {
                 self.emit(started(name.to_owned(), None));
                 return (e, true);
             }
         };
-        self.emit(started(call.summary(), Some(call.activity())));
+        let source = call.summary();
+        let shown = match &save_as {
+            Some(var) => format!("{source} → ${var}"),
+            None => source.clone(),
+        };
+        self.emit(started(shown, Some(call.activity())));
+        let shows_variable = call.shows_variable();
 
         let mode = self.modes.get(&self.mode).expect("current mode exists");
         let file_write = matches!(call, ToolCall::WriteFile { .. } | ToolCall::EditFile { .. });
@@ -1107,9 +1121,14 @@ impl Agent {
             );
         }
 
-        match self.run_call(call).await {
-            Ok(text) => (text, false),
-            Err(e) => (e.0, true),
+        match (self.run_call(call).await, save_as) {
+            (Ok(text), Some(var)) => match self.vars.save(&var, text, source) {
+                Ok(summary) => (summary, false),
+                Err(e) => (e.0, true),
+            },
+            (Ok(text), None) if shows_variable => (vars::cap_output(&text), false),
+            (Ok(text), None) => (text, false),
+            (Err(e), _) => (e.0, true),
         }
     }
 
@@ -1192,6 +1211,46 @@ impl Agent {
                 self.apply_write(write).await
             }
             ToolCall::RunCommand { name, reason } => self.run_command(&name, &reason).await,
+            // The model's own patterns and replacements could add invisible characters, so
+            // results are filtered again.
+            ToolCall::VarGrep {
+                var,
+                pattern,
+                context,
+                invert,
+                only_matching,
+            } => {
+                let re = vars::regex(&pattern)?;
+                let text = &self.vars.get(&var)?.text;
+                Ok(reveal(vars::grep(
+                    text,
+                    &re,
+                    context,
+                    invert,
+                    only_matching,
+                )))
+            }
+            ToolCall::VarReplace {
+                var,
+                pattern,
+                replacement,
+            } => {
+                let re = vars::regex(&pattern)?;
+                let text = &self.vars.get(&var)?.text;
+                Ok(reveal(vars::replace(text, &re, &replacement)))
+            }
+            ToolCall::VarLines { var, options } => {
+                Ok(vars::lines(&self.vars.get(&var)?.text, &options))
+            }
+            ToolCall::VarShow { var } => Ok(self.vars.get(&var)?.text.clone()),
+            ToolCall::VarList { drop } => {
+                let missing = self.vars.drop_vars(&drop);
+                let mut out = self.vars.list();
+                if !missing.is_empty() {
+                    out = format!("No such variable: {}\n{out}", missing.join(", "));
+                }
+                Ok(out)
+            }
         }
     }
 

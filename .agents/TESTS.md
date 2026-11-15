@@ -18,7 +18,8 @@ access, API keys or an installed CLI.
 - **cradle-tools**: path guard (escapes, symlinks, `.git/`, ignored and secret files,
   protected files); file tools; command splitting, failure and timeout; tool call
   parsing (including `ask_user` question kinds and option limits); invisible-character
-  hygiene.
+  hygiene; tool variables (`save_as` summaries, name checks, size limits, `var_grep`
+  context and separators, `var_replace`, `var_lines` order, output cap).
 - **cradle-mcp**: the server over a real local socket: initialize, list and call (routed
   to the channel); refusal without the token or with an `Origin`; unknown tools.
 - **cradle-core**: trust snapshot hash stability, diff and store round trip; mode
@@ -46,6 +47,8 @@ rules whatever the model asks for:
 - config reload: a changed config is shown as a diff (decline keeps the old one), an
   approved change applies before the message, an unchanged one is not asked about
 - `read_files` returns every file and reports per-file failures
+- `save_as` returns a summary instead of the result; `var_*` tools filter saved results
+  in plan mode; unknown variables are errors
 
 ## Rules for new tests
 

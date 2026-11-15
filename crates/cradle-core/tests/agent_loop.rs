@@ -662,3 +662,68 @@ async fn unchanged_config_is_not_asked_about() {
     let second = &requests.lock().unwrap()[1];
     assert!(second["system"].to_string().contains("v2 product"));
 }
+
+#[tokio::test]
+async fn saved_results_are_summarised_and_filtered() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    fs::write(tmp.path().join("a.txt"), "fn alpha\n").unwrap();
+    fs::write(tmp.path().join("b.txt"), "fn beta\nfn gamma\n").unwrap();
+    let (url, requests) = fake_server(vec![
+        tool_call(
+            "t1",
+            "search",
+            json!({"pattern": "^fn ", "save_as": "hits"}),
+        ),
+        tool_call(
+            "t2",
+            "var_replace",
+            json!({"var": "hits", "pattern": "^([^:]+):.*", "replacement": "$1", "save_as": "paths"}),
+        ),
+        tool_call(
+            "t3",
+            "var_lines",
+            json!({"var": "$paths", "unique": true, "sort": true}),
+        ),
+        tool_call("t4", "var_show", json!({"var": "nope"})),
+        text("ok"),
+    ])
+    .await;
+    // Variable tools are read-only, so plan mode may use them.
+    let mut agent = start(&url, tmp.path(), "plan", ReviewPolicy::User);
+
+    agent
+        .commands
+        .send(AgentCommand::Send("find".into()))
+        .unwrap();
+    let mut started = Vec::new();
+    while let Some(event) = agent.events.recv().await {
+        match event {
+            AgentEvent::ToolStarted { summary, .. } => started.push(summary),
+            AgentEvent::TurnFinished => break,
+            _ => {}
+        }
+    }
+
+    let (content, is_error) = tool_result(&requests, 1);
+    assert!(!is_error, "{content}");
+    assert!(
+        content.starts_with("saved $hits: 3 lines, "),
+        "a summary, not the full result: {content}"
+    );
+    let (content, is_error) = tool_result(&requests, 2);
+    assert!(
+        !is_error && content.starts_with("saved $paths: 3 lines"),
+        "{content}"
+    );
+    let (content, is_error) = tool_result(&requests, 3);
+    assert!(!is_error, "{content}");
+    assert_eq!(content, "a.txt\nb.txt");
+    let (content, is_error) = tool_result(&requests, 4);
+    assert!(
+        is_error && content.contains("no variable `$nope`"),
+        "{content}"
+    );
+    // The UI shows where a result was saved.
+    assert_eq!(started[0], "search /^fn / in . → $hits");
+}

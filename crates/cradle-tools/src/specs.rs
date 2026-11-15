@@ -3,6 +3,8 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::vars::{LineOptions, MAX_SHOW_LINES};
+
 /// What a tool can do. Modes with read-only access only get [`Access::Read`] tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -80,6 +82,8 @@ pub enum ActivityKind {
     Write,
     Edit,
     Command,
+    /// A `var_*` tool: works on saved results only.
+    Var,
 }
 
 impl ActivityKind {
@@ -87,7 +91,7 @@ impl ActivityKind {
     pub fn groups(self) -> bool {
         matches!(
             self,
-            ActivityKind::Read | ActivityKind::List | ActivityKind::Search
+            ActivityKind::Read | ActivityKind::List | ActivityKind::Search | ActivityKind::Var
         )
     }
 
@@ -102,6 +106,7 @@ impl ActivityKind {
             ActivityKind::Write => ("wrote", "file", "files"),
             ActivityKind::Edit => ("edited", "file", "files"),
             ActivityKind::Command => ("ran", "command", "commands"),
+            ActivityKind::Var => ("ran", "variable tool", "variable tools"),
         };
         format!("{verb} {count} {}", if count == 1 { one } else { many })
     }
@@ -166,6 +171,28 @@ pub enum ToolCall {
         name: String,
         reason: String,
     },
+    VarGrep {
+        var: String,
+        pattern: String,
+        context: usize,
+        invert: bool,
+        only_matching: bool,
+    },
+    VarReplace {
+        var: String,
+        pattern: String,
+        replacement: String,
+    },
+    VarLines {
+        var: String,
+        options: LineOptions,
+    },
+    VarShow {
+        var: String,
+    },
+    VarList {
+        drop: Vec<String>,
+    },
 }
 
 impl ToolCall {
@@ -176,7 +203,12 @@ impl ToolCall {
             | ToolCall::ListFiles { .. }
             | ToolCall::Search { .. }
             | ToolCall::GitDiff { .. }
-            | ToolCall::AskUser { .. } => Access::Read,
+            | ToolCall::AskUser { .. }
+            | ToolCall::VarGrep { .. }
+            | ToolCall::VarReplace { .. }
+            | ToolCall::VarLines { .. }
+            | ToolCall::VarShow { .. }
+            | ToolCall::VarList { .. } => Access::Read,
             ToolCall::WriteFile { .. }
             | ToolCall::EditFile { .. }
             | ToolCall::RunCommand { .. } => Access::Write,
@@ -212,7 +244,26 @@ impl ToolCall {
             ToolCall::WriteFile { path, .. } => format!("write {path}"),
             ToolCall::EditFile { path, .. } => format!("edit {path}"),
             ToolCall::RunCommand { name, .. } => format!("run `{name}`"),
+            ToolCall::VarGrep { var, pattern, .. } => format!("grep /{pattern}/ in ${var}"),
+            ToolCall::VarReplace { var, pattern, .. } => {
+                format!("replace /{pattern}/ in ${var}")
+            }
+            ToolCall::VarLines { var, .. } => format!("pick lines of ${var}"),
+            ToolCall::VarShow { var } => format!("show ${var}"),
+            ToolCall::VarList { drop } if drop.is_empty() => "list variables".into(),
+            ToolCall::VarList { drop } => format!("drop {}", dollar_list(drop)),
         }
+    }
+
+    /// Whether this is a `var_*` tool that returns text to the model.
+    pub fn shows_variable(&self) -> bool {
+        matches!(
+            self,
+            ToolCall::VarGrep { .. }
+                | ToolCall::VarReplace { .. }
+                | ToolCall::VarLines { .. }
+                | ToolCall::VarShow { .. }
+        )
     }
 
     /// What this call does, for grouping and counting in the UI.
@@ -251,8 +302,21 @@ impl ToolCall {
             ToolCall::WriteFile { path, .. } => ToolActivity::one(K::Write, path.clone()),
             ToolCall::EditFile { path, .. } => ToolActivity::one(K::Edit, path.clone()),
             ToolCall::RunCommand { name, .. } => ToolActivity::one(K::Command, name.clone()),
+            ToolCall::VarGrep { .. }
+            | ToolCall::VarReplace { .. }
+            | ToolCall::VarLines { .. }
+            | ToolCall::VarShow { .. }
+            | ToolCall::VarList { .. } => ToolActivity::one(K::Var, self.summary()),
         }
     }
+}
+
+fn dollar_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("${}", n.strip_prefix('$').unwrap_or(n)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn list_target(path: &Option<String>, glob: &Option<String>) -> String {
@@ -278,7 +342,7 @@ pub fn definitions(commands: &[(&str, &str)]) -> Vec<ToolDefinition> {
     };
     let command_names: Vec<&str> = commands.iter().map(|(name, _)| *name).collect();
 
-    vec![
+    let mut defs = vec![
         ToolDefinition {
             name: "read_file",
             description: "Read a UTF-8 text file in the project. Returns numbered lines. \
@@ -466,7 +530,114 @@ pub fn definitions(commands: &[(&str, &str)]) -> Vec<ToolDefinition> {
             }),
             access: Access::Write,
         },
-    ]
+        ToolDefinition {
+            name: "var_grep",
+            description: "Keep the lines of a saved variable that match a regular expression \
+                          (Rust regex syntax), like grep. `context` adds lines around each \
+                          match, `invert` keeps the lines that don't match, and \
+                          `only_matching` returns just the matched text."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "var": {"type": "string", "description": "Variable name"},
+                    "pattern": {"type": "string"},
+                    "context": {"type": "integer", "minimum": 0},
+                    "invert": {"type": "boolean"},
+                    "only_matching": {"type": "boolean"}
+                },
+                "required": ["var", "pattern"],
+                "additionalProperties": false
+            }),
+            access: Access::Read,
+        },
+        ToolDefinition {
+            name: "var_replace",
+            description: "Regex replace in every line of a saved variable (`$1` or `${name}` \
+                          for groups). For example, pattern `^([^:]+):.*` with replacement \
+                          `$1` turns search results into paths."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "var": {"type": "string", "description": "Variable name"},
+                    "pattern": {"type": "string"},
+                    "replacement": {"type": "string"}
+                },
+                "required": ["var", "pattern", "replacement"],
+                "additionalProperties": false
+            }),
+            access: Access::Read,
+        },
+        ToolDefinition {
+            name: "var_lines",
+            description: "Pick lines from a saved variable. Applied in this order: `from`/`to` \
+                          (1-based, inclusive), `unique` (drop repeated lines), `sort`, then \
+                          `head`/`tail`."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "var": {"type": "string", "description": "Variable name"},
+                    "from": {"type": "integer", "minimum": 1},
+                    "to": {"type": "integer", "minimum": 1},
+                    "unique": {"type": "boolean"},
+                    "sort": {"type": "boolean"},
+                    "head": {"type": "integer", "minimum": 0},
+                    "tail": {"type": "integer", "minimum": 0}
+                },
+                "required": ["var"],
+                "additionalProperties": false
+            }),
+            access: Access::Read,
+        },
+        ToolDefinition {
+            name: "var_show",
+            description: format!(
+                "Return the contents of a saved variable (at most {MAX_SHOW_LINES} lines; use \
+                 var_lines to page through longer ones)."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "var": {"type": "string", "description": "Variable name"}
+                },
+                "required": ["var"],
+                "additionalProperties": false
+            }),
+            access: Access::Read,
+        },
+        ToolDefinition {
+            name: "var_list",
+            description: "List the saved variables with their size and the call that \
+                          produced each. `drop` removes variables by name first."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "drop": {"type": "array", "items": {"type": "string"}}
+                },
+                "additionalProperties": false
+            }),
+            access: Access::Read,
+        },
+    ];
+
+    // Every tool can save its result instead of returning it.
+    for def in &mut defs {
+        if let Some(properties) = def.input_schema["properties"].as_object_mut() {
+            properties.insert(
+                "save_as".into(),
+                json!({
+                    "type": "string",
+                    "description": "Save the full result as a variable with this name \
+                                    (letters, digits, _) and get only a short summary back. \
+                                    Filter it with the var_* tools."
+                }),
+            );
+        }
+    }
+    defs
 }
 
 #[derive(Deserialize)]
@@ -578,6 +749,62 @@ struct RunCommandInput {
     reason: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VarGrepInput {
+    var: String,
+    pattern: String,
+    #[serde(default)]
+    context: usize,
+    #[serde(default)]
+    invert: bool,
+    #[serde(default)]
+    only_matching: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VarReplaceInput {
+    var: String,
+    pattern: String,
+    replacement: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VarLinesInput {
+    var: String,
+    from: Option<usize>,
+    to: Option<usize>,
+    #[serde(default)]
+    unique: bool,
+    #[serde(default)]
+    sort: bool,
+    head: Option<usize>,
+    tail: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VarInput {
+    var: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VarListInput {
+    #[serde(default)]
+    drop: Vec<String>,
+}
+
+/// A variable name as the model wrote it, without a leading `$`.
+fn var_name(name: String) -> String {
+    match name.strip_prefix('$') {
+        Some(bare) => bare.to_owned(),
+        None => name,
+    }
+}
+
 /// Validate a tool call's input against its schema. The error is returned to the model.
 pub fn parse_call(name: &str, input: &Value) -> Result<ToolCall, String> {
     fn de<T: serde::de::DeserializeOwned>(input: &Value) -> Result<T, String> {
@@ -664,6 +891,62 @@ pub fn parse_call(name: &str, input: &Value) -> Result<ToolCall, String> {
                 reason: i.reason,
             }
         }
+        "var_grep" => {
+            let i: VarGrepInput = de(input)?;
+            if i.invert && i.only_matching {
+                return Err(
+                    "invalid input: `invert` and `only_matching` can't be used together".into(),
+                );
+            }
+            ToolCall::VarGrep {
+                var: var_name(i.var),
+                pattern: i.pattern,
+                context: i.context,
+                invert: i.invert,
+                only_matching: i.only_matching,
+            }
+        }
+        "var_replace" => {
+            let i: VarReplaceInput = de(input)?;
+            ToolCall::VarReplace {
+                var: var_name(i.var),
+                pattern: i.pattern,
+                replacement: i.replacement,
+            }
+        }
+        "var_lines" => {
+            let i: VarLinesInput = de(input)?;
+            if let (Some(from), Some(to)) = (i.from, i.to)
+                && from > to
+            {
+                return Err(format!(
+                    "invalid input: `from` ({from}) is after `to` ({to})"
+                ));
+            }
+            ToolCall::VarLines {
+                var: var_name(i.var),
+                options: LineOptions {
+                    from: i.from,
+                    to: i.to,
+                    unique: i.unique,
+                    sort: i.sort,
+                    head: i.head,
+                    tail: i.tail,
+                },
+            }
+        }
+        "var_show" => {
+            let i: VarInput = de(input)?;
+            ToolCall::VarShow {
+                var: var_name(i.var),
+            }
+        }
+        "var_list" => {
+            let i: VarListInput = de(input)?;
+            ToolCall::VarList {
+                drop: i.drop.into_iter().map(var_name).collect(),
+            }
+        }
         other => return Err(format!("unknown tool `{other}`")),
     })
 }
@@ -702,10 +985,96 @@ mod tests {
                 "ask_user",
                 "write_file",
                 "edit_file",
-                "run_command"
+                "run_command",
+                "var_grep",
+                "var_replace",
+                "var_lines",
+                "var_show",
+                "var_list"
             ]
         );
         assert!(defs[8].description.contains("`test`: cargo test"));
+        // Every tool can save its result.
+        for def in &defs {
+            assert!(
+                def.input_schema["properties"]["save_as"].is_object(),
+                "{}",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn parses_variable_tools() {
+        let call = parse_call(
+            "var_grep",
+            &json!({"var": "$hits", "pattern": "fn", "context": 2}),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            ToolCall::VarGrep {
+                var: "hits".into(),
+                pattern: "fn".into(),
+                context: 2,
+                invert: false,
+                only_matching: false
+            }
+        );
+        assert_eq!(call.summary(), "grep /fn/ in $hits");
+        assert_eq!(call.access(), Access::Read);
+        assert!(call.shows_variable());
+        assert_eq!(call.activity().kind, ActivityKind::Var);
+        assert!(ActivityKind::Var.groups());
+
+        let err = parse_call(
+            "var_grep",
+            &json!({"var": "a", "pattern": "x", "invert": true, "only_matching": true}),
+        )
+        .unwrap_err();
+        assert!(err.contains("can't be used together"), "{err}");
+
+        let lines = parse_call(
+            "var_lines",
+            &json!({"var": "a", "from": 2, "to": 5, "unique": true, "head": 1}),
+        )
+        .unwrap();
+        let ToolCall::VarLines { options, .. } = &lines else {
+            panic!("{lines:?}")
+        };
+        assert_eq!(
+            options,
+            &LineOptions {
+                from: Some(2),
+                to: Some(5),
+                unique: true,
+                head: Some(1),
+                ..Default::default()
+            }
+        );
+        assert!(parse_call("var_lines", &json!({"var": "a", "from": 5, "to": 2})).is_err());
+
+        let replace = parse_call(
+            "var_replace",
+            &json!({"var": "a", "pattern": "^(.*)$", "replacement": "$1"}),
+        )
+        .unwrap();
+        assert_eq!(replace.summary(), "replace /^(.*)$/ in $a");
+        assert!(parse_call("var_replace", &json!({"var": "a", "pattern": "x"})).is_err());
+
+        assert_eq!(
+            parse_call("var_show", &json!({"var": "a"}))
+                .unwrap()
+                .summary(),
+            "show $a"
+        );
+        let list = parse_call("var_list", &json!({})).unwrap();
+        assert_eq!(list.summary(), "list variables");
+        assert!(!list.shows_variable());
+        let drop = parse_call("var_list", &json!({"drop": ["a", "$b"]})).unwrap();
+        assert_eq!(drop.summary(), "drop $a, $b");
+        // `save_as` is taken off before parsing, so it is unknown here.
+        assert!(parse_call("var_show", &json!({"var": "a", "save_as": "b"})).is_err());
     }
 
     #[test]

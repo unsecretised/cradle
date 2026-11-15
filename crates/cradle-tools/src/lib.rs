@@ -8,12 +8,14 @@ pub mod fs;
 pub mod guard;
 pub mod hygiene;
 pub mod specs;
+pub mod vars;
 
 pub use guard::{GuardError, PathGuard, Resolved, WriteClass};
 pub use specs::{
     Access, ActivityKind, FileRange, MAX_OPTIONS, Question, QuestionKind, ToolActivity, ToolCall,
     ToolDefinition, definitions, parse_call,
 };
+pub use vars::VarStore;
 
 /// A tool failure, reported back to the model as an error result.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
