@@ -1,5 +1,15 @@
 <!--This file is not to be edited by any agent. Strictly only for initial development and setup purposes-->
-# Cradle coding agent harness:
+# Cradle coding agent harness
+
+> I'm currently writing a blog about what makes this different from other AI harnessess.
+> But the core difference is using a structured format to reduce the context window usage and let AI agents get only the data you need.
+> The name cradle fits it because this harness treats the agent like a baby and controls what it has access to. (not to be confused with security)
+> I will also be prioritising security (such as doing my best to prevent prompt injections, and preventing arbitrary code execution when trying to contribute to a repo.)
+
+Ironically, here's my unstructured (and slightly outdated) list of features that this harness uses.
+
+Take a look inside [.agents/features.md`](.agents/features.md) for a more accurate list of features.
+
 - .agents/ directory instead of AGENTS.md, consisting off:
 	- features/
 		- FEATURE_XYZ.md
@@ -37,6 +47,7 @@
 - no automatic commiting / branch / stash / pr creation. Only git diff is allowed.
 - Configurable "Soul" such as "Ask more questions" / "Ask fewer questions", "Verify builds automatically", "Ask techincal questions" vs "Assume no technical knowledge". Anything that is project configured must be run through by the user. (e.g. the "override" / crash_handler for custom modes)
 - Custom Modes (default is plan and build mode) 
+
 ```toml
 [default]
 plan_mode = "modes/plan_mode.md" # not allowed to read files outside of .agents/ for modes, actual file path is .agents/modes/plan_mode.md
