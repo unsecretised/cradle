@@ -7,15 +7,17 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use cradle_config::soul::SoulKey;
 use cradle_config::{ModeAccess, ProjectConfig, SourceKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::modes::ClashChoice;
+use crate::soul::SoulChoice;
 
 /// Everything in the project config that changes Cradle's behaviour, as readable text:
 /// the config form, `[commands]`, each mode's access, commands and file content, the
-/// rules, and each skill. Stored when the user trusts the config, so a later change can be
+/// project's preferences, the rules, and each skill. Stored when the user trusts the config, so a later change can be
 /// shown as a diff.
 pub fn snapshot(config: &ProjectConfig) -> io::Result<String> {
     let root = config
@@ -86,6 +88,17 @@ pub fn snapshot(config: &ProjectConfig) -> io::Result<String> {
         }
     }
 
+    // Only when set, so configs without preferences keep the hash they were trusted with.
+    if !config.soul.is_empty() {
+        writeln!(
+            out,
+            "\n[preferences]  (you choose between these and your own)"
+        )
+        .unwrap();
+        for (key, value) in config.soul.entries() {
+            writeln!(out, "{} = {value}", key.name()).unwrap();
+        }
+    }
     if let Some(rules) = &config.docs.rules {
         writeln!(out, "\n[rules]").unwrap();
         push_body(&mut out, rules);
@@ -135,6 +148,18 @@ struct ProjectRecord {
     /// "dir" or "file", when both `.agents/` and `agents.toml` exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    /// For each preference the project sets differently from the user: which applies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    soul: BTreeMap<String, SoulRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SoulRecord {
+    /// The project's value when the user chose. A new value asks again.
+    project: String,
+    /// "project" or "mine".
+    #[serde(rename = "use")]
+    choice: String,
 }
 
 /// `~/.config/cradle/trust.toml`, keyed by canonical project path.
@@ -206,6 +231,41 @@ impl TrustStore {
                 ClashChoice::Combine => "combine",
             }
             .to_owned(),
+        );
+        self.save()
+    }
+
+    /// Whether the user picked the project's value or their own when the project set `key`
+    /// to `value`. `None` if they haven't, or the project's value has changed since.
+    pub fn soul_choice(&self, root: &Path, key: SoulKey, value: &str) -> Option<SoulChoice> {
+        let record = self.record(root)?.soul.get(key.name())?;
+        if record.project != value {
+            return None;
+        }
+        match record.choice.as_str() {
+            "project" => Some(SoulChoice::Project),
+            "mine" => Some(SoulChoice::Mine),
+            _ => None,
+        }
+    }
+
+    pub fn set_soul_choice(
+        &mut self,
+        root: &Path,
+        key: SoulKey,
+        value: &str,
+        choice: SoulChoice,
+    ) -> io::Result<()> {
+        let choice = match choice {
+            SoulChoice::Project => "project",
+            SoulChoice::Mine => "mine",
+        };
+        self.record_mut(root).soul.insert(
+            key.name().to_owned(),
+            SoulRecord {
+                project: value.to_owned(),
+                choice: choice.to_owned(),
+            },
         );
         self.save()
     }
@@ -350,5 +410,52 @@ mod tests {
         store.trust(tmp.path(), "two").unwrap();
         assert!(store.is_trusted(tmp.path(), &h2));
         assert_eq!(store.approved_snapshot(tmp.path()).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn project_preferences_are_trusted_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = snapshot(&config(tmp.path(), "cargo test", "plan")).unwrap();
+        assert!(!plain.contains("[preferences]"), "absent unless set");
+
+        fs::write(tmp.path().join(".agents/soul.toml"), "questions = 9").unwrap();
+        let with = snapshot(&config(tmp.path(), "cargo test", "plan")).unwrap();
+        let diff = config_diff(Some(&plain), &with);
+        assert!(diff.contains("+questions = 9"), "{diff}");
+    }
+
+    #[test]
+    fn soul_choices_round_trip_and_reset_on_new_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trust.toml");
+        let mut store = TrustStore::load(path.clone()).unwrap();
+        let root = tmp.path();
+        assert_eq!(store.soul_choice(root, SoulKey::Questions, "9"), None);
+        store
+            .set_soul_choice(root, SoulKey::Questions, "9", SoulChoice::Mine)
+            .unwrap();
+        store
+            .set_soul_choice(
+                root,
+                SoulKey::Audience,
+                "non-technical",
+                SoulChoice::Project,
+            )
+            .unwrap();
+
+        let store = TrustStore::load(path).unwrap();
+        assert_eq!(
+            store.soul_choice(root, SoulKey::Questions, "9"),
+            Some(SoulChoice::Mine)
+        );
+        assert_eq!(
+            store.soul_choice(root, SoulKey::Audience, "non-technical"),
+            Some(SoulChoice::Project)
+        );
+        assert_eq!(
+            store.soul_choice(root, SoulKey::Questions, "2"),
+            None,
+            "a new project value asks again"
+        );
     }
 }

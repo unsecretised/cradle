@@ -1,4 +1,5 @@
-//! The `ask_user` modal: one or more questions, answered one at a time.
+//! The `ask_user` modal: one or more questions, answered one at a time. `/preferences`
+//! uses it too.
 //!
 //! Choice questions (`single`, `multi`) also take a typed answer of the user's own.
 //! Shift+Tab goes back to an earlier question. Esc dismisses the whole batch, after a
@@ -27,6 +28,12 @@ pub(crate) struct Questions {
     /// Asking whether to dismiss every question.
     confirm_dismiss: bool,
     reply: Option<oneshot::Sender<Vec<Answer>>>,
+    /// Shown in the title.
+    heading: &'static str,
+    /// The option highlighted at first, per question.
+    defaults: Vec<usize>,
+    /// Asked by the UI itself (`/preferences`), not the agent: stays open when a turn ends.
+    pub local: bool,
 }
 
 impl Questions {
@@ -40,7 +47,26 @@ impl Questions {
             input: Input::default(),
             confirm_dismiss: false,
             reply: Some(reply),
+            heading: "The agent asks",
+            defaults: Vec::new(),
+            local: false,
         };
+        q.load();
+        q
+    }
+
+    /// Questions the UI asks, under `heading`, with `defaults[i]` highlighted first on
+    /// question `i`.
+    pub fn local(
+        heading: &'static str,
+        questions: Vec<Question>,
+        defaults: Vec<usize>,
+        reply: oneshot::Sender<Vec<Answer>>,
+    ) -> Self {
+        let mut q = Questions::new(questions, reply);
+        q.heading = heading;
+        q.defaults = defaults;
+        q.local = true;
         q.load();
         q
     }
@@ -52,7 +78,12 @@ impl Questions {
     /// Show the current question, with its earlier answer if it has one.
     fn load(&mut self) {
         let options = self.questions[self.current].options.clone();
-        self.selected = 0;
+        self.selected = self
+            .defaults
+            .get(self.current)
+            .copied()
+            .filter(|i| *i < options.len())
+            .unwrap_or(0);
         self.checked = vec![false; options.len()];
         self.input = Input::default();
         match &self.answers[self.current] {
@@ -183,9 +214,10 @@ impl Questions {
     }
 
     pub fn title(&self) -> String {
+        let heading = self.heading;
         match self.questions.len() {
-            1 => " The agent asks ".to_owned(),
-            n => format!(" The agent asks ({} of {n}) ", self.current + 1),
+            1 => format!(" {heading} "),
+            n => format!(" {heading} ({} of {n}) ", self.current + 1),
         }
     }
 

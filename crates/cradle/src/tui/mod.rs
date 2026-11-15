@@ -4,6 +4,7 @@ mod commands;
 mod markdown;
 mod onboard;
 mod picker;
+mod preferences;
 mod questions;
 mod text;
 pub mod theme;
@@ -30,7 +31,9 @@ use futures_util::StreamExt;
 use tokio::sync::oneshot;
 
 use cradle_backends::{Backend, available_models};
+use cradle_config::soul::Soul;
 use cradle_config::user::UserConfig;
+use cradle_core::Answer;
 use cradle_provider_spec::{Backend as SpecBackend, ProviderSpec};
 use tokio::sync::mpsc;
 
@@ -84,11 +87,15 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         backend,
         preselect,
         user_config,
+        soul_path,
+        soul_missing,
     } = session;
     let mut keys = EventStream::new();
     let theme_path = cradle_config::paths::theme();
     let (theme, theme_warnings) = theme::load(theme_path.as_deref());
 
+    // After the setup screen (first run, `--setup`), the preferences come next.
+    let onboarded = backend.is_err();
     let backend = match backend {
         Ok(backend) => backend,
         Err(reason) => {
@@ -120,8 +127,16 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         theme,
         theme_warnings,
         theme_path,
+        soul_path,
     };
     let mut app = App::new(info, &setup);
+    if onboarded {
+        app.open_preferences();
+    } else if soul_missing {
+        app.note(
+            "Tell Cradle how you like to work (questions, technical terms, checks): /preferences",
+        );
+    }
     app.load_models();
     let mut handle = cradle_core::spawn(setup);
     event_loop(terminal, &mut keys, &mut app, &mut handle).await
@@ -139,6 +154,8 @@ struct StartInfo<'a> {
     theme_warnings: Vec<String>,
     /// `~/.config/cradle/theme.toml`, for `/theme`.
     theme_path: Option<PathBuf>,
+    /// `~/.config/cradle/soul.toml`, where `/preferences` saves.
+    soul_path: Option<PathBuf>,
 }
 
 /// Results of work the UI started in the background.
@@ -146,6 +163,8 @@ enum UiEvent {
     /// `provider/model` for every usable provider, and why the current provider's models
     /// could not be listed live.
     Models(Vec<String>, Option<String>),
+    /// Answers to `/preferences`.
+    Preferences(Vec<Answer>),
 }
 
 async fn event_loop(
@@ -161,7 +180,7 @@ async fn event_loop(
             .draw(|frame| view::draw(frame, app))
             .map_err(Error::Terminal)?;
         tokio::select! {
-            Some(event) = ui_events.recv() => app.on_ui(event),
+            Some(event) = ui_events.recv() => app.on_ui(event, handle),
             event = keys.next() => match event {
                 Some(Ok(event)) => app.on_terminal(event, handle),
                 Some(Err(e)) => return Err(Error::Terminal(e)),
@@ -279,6 +298,9 @@ pub(crate) struct App {
     suggest_hidden: bool,
     pub theme: Theme,
     theme_path: Option<PathBuf>,
+    /// The user's own preferences, as last saved.
+    soul: Soul,
+    soul_path: Option<PathBuf>,
 }
 
 impl App {
@@ -359,6 +381,8 @@ impl App {
             suggest_hidden: false,
             theme: info.theme,
             theme_path: info.theme_path,
+            soul: setup.soul,
+            soul_path: info.soul_path,
         }
     }
 
@@ -445,8 +469,14 @@ impl App {
             AgentEvent::Error(e) => self.items.push(Item::Error(e)),
             AgentEvent::TurnFinished => {
                 self.busy = false;
-                // A cancelled turn may leave a modal whose request is gone.
-                if !matches!(self.modal, Some(Modal::Help)) {
+                // A cancelled turn may leave a modal whose request is gone. The UI's own
+                // modals stay.
+                let ours = match &self.modal {
+                    Some(Modal::Help) => true,
+                    Some(Modal::Question(q)) => q.local,
+                    _ => false,
+                };
+                if !ours {
                     self.modal = None;
                 }
             }
@@ -798,9 +828,18 @@ impl App {
             .trim_start()
             .split_once(char::is_whitespace)
             .map_or("", |(_, rest)| rest.trim());
+        // `preferences` too: the agent's own questions would replace its modal.
         let idle_only = matches!(
             name,
-            "mode" | "plan" | "build" | "clear" | "diff" | "model" | "session" | "skill"
+            "mode"
+                | "plan"
+                | "build"
+                | "clear"
+                | "diff"
+                | "model"
+                | "session"
+                | "skill"
+                | "preferences"
         );
         if idle_only && self.busy {
             self.note("Wait for the turn to finish (or Esc to cancel) first.");
@@ -843,6 +882,7 @@ impl App {
             ("theme", None) => self.describe_theme(),
             ("theme", Some("reload")) => self.reload_theme(),
             ("theme", _) => self.note("Usage: /theme | /theme reload"),
+            ("preferences", _) => self.open_preferences(),
             ("clear", _) => {
                 self.items.clear();
                 self.usage = Usage::default();
@@ -886,7 +926,7 @@ impl App {
         self.items.extend(theme_notices(&warnings));
     }
 
-    fn on_ui(&mut self, event: UiEvent) {
+    fn on_ui(&mut self, event: UiEvent, handle: &AgentHandle) {
         match event {
             UiEvent::Models(models, error) => {
                 self.known_models = models.clone();
@@ -896,7 +936,61 @@ impl App {
                     picker.set_models(models, error);
                 }
             }
+            UiEvent::Preferences(answers) => self.save_preferences(&answers, handle),
         }
+    }
+
+    /// `/preferences`: ask each preference, starting at the current values. The answers
+    /// arrive as [`UiEvent::Preferences`]; dismissing changes nothing.
+    fn open_preferences(&mut self) {
+        let (reply, answers) = oneshot::channel();
+        self.modal = Some(Modal::Question(Questions::local(
+            "Preferences",
+            preferences::questions(),
+            preferences::defaults(&self.soul),
+            reply,
+        )));
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            if let Ok(answers) = answers.await {
+                let _ = ui.send(UiEvent::Preferences(answers));
+            }
+        });
+    }
+
+    /// Save answered preferences to `soul.toml` and hand them to the agent.
+    fn save_preferences(&mut self, answers: &[Answer], handle: &AgentHandle) {
+        let (soul, ignored) = preferences::apply(&self.soul, answers);
+        self.soul = soul;
+        send(handle, AgentCommand::SetSoul(soul));
+        let saved = match &self.soul_path {
+            Some(path) => match soul.save(path) {
+                Ok(()) => format!("saved to {}", path.display()),
+                Err(e) => {
+                    self.items.push(Item::Error(format!(
+                        "cannot save {}: {e} (they apply to this session only)",
+                        path.display()
+                    )));
+                    "this session only".to_owned()
+                }
+            },
+            None => "this session only: no config directory".to_owned(),
+        };
+        let auto_verify = if soul.auto_verify { "on" } else { "off" };
+        let mut text = format!(
+            "Preferences ({saved}): questions {} of 10, {}, {}, auto_verify {auto_verify}. \
+             They apply from your next message.",
+            soul.questions,
+            soul.value(cradle_config::soul::SoulKey::Audience),
+            soul.value(cradle_config::soul::SoulKey::Detail),
+        );
+        if !ignored.is_empty() {
+            text.push_str(&format!(
+                " Kept the current value for {}: the typed answer didn't match an option.",
+                ignored.join(", ")
+            ));
+        }
+        self.note(&text);
     }
 
     /// List every usable provider's models in the background. The current provider's
@@ -1172,6 +1266,7 @@ mod tests {
             data_dir: None,
             trust_store: None,
             global_modes: None,
+            soul: Soul::default(),
         };
         let info = StartInfo {
             root: dir,
@@ -1183,6 +1278,7 @@ mod tests {
             theme: Theme::default(),
             theme_warnings: Vec::new(),
             theme_path,
+            soul_path: Some(dir.join("soul.toml")),
         };
         let app = App::new(info, &setup);
         (app, cradle_core::spawn(setup))
@@ -1637,6 +1733,62 @@ mod tests {
         type_text(&mut app, &handle, "y");
         assert!(app.modal.is_none());
         assert!(answers.await.is_err(), "the sender was dropped");
+    }
+
+    #[tokio::test]
+    async fn preferences_are_asked_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, handle) = start(dir.path());
+        let mut ui_events = app.ui_events.take().unwrap();
+
+        // The alias opens the same questions, starting at the current values.
+        type_text(&mut app, &handle, "/soul");
+        press(&mut app, &handle, KeyCode::Enter);
+        let s = screen(&app);
+        assert!(s.contains("Preferences (1 of 4)"), "{s}");
+        assert!(s.contains("How often should the agent ask"), "{s}");
+
+        type_text(&mut app, &handle, "8"); // questions: 8
+        press(&mut app, &handle, KeyCode::Enter); // audience: current (technical)
+        type_text(&mut app, &handle, "2"); // detail: detailed
+        // A turn ending doesn't close the UI's own questions.
+        app.on_agent(AgentEvent::TurnFinished);
+        assert!(app.modal.is_some());
+        type_text(&mut app, &handle, "2"); // auto_verify: on
+        assert!(app.modal.is_none());
+
+        let event = tokio::time::timeout(Duration::from_secs(5), ui_events.recv())
+            .await
+            .expect("answers arrive")
+            .unwrap();
+        app.on_ui(event, &handle);
+        let saved = Soul::load(&dir.path().join("soul.toml")).unwrap().unwrap();
+        assert_eq!(saved.questions, 8);
+        assert_eq!(saved.audience, cradle_config::soul::Audience::Technical);
+        assert_eq!(saved.detail, cradle_config::soul::Detail::Detailed);
+        assert!(saved.auto_verify);
+        assert!(
+            matches!(app.items.last(), Some(Item::Notice(n)) if n.contains("questions 8 of 10")),
+            "the saved values are shown"
+        );
+
+        // Reopened, it starts at the saved values.
+        type_text(&mut app, &handle, "/preferences");
+        press(&mut app, &handle, KeyCode::Enter);
+        press(&mut app, &handle, KeyCode::Enter);
+        press(&mut app, &handle, KeyCode::Enter);
+        press(&mut app, &handle, KeyCode::Enter);
+        press(&mut app, &handle, KeyCode::Enter);
+        let event = tokio::time::timeout(Duration::from_secs(5), ui_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.on_ui(event, &handle);
+        assert_eq!(
+            Soul::load(&dir.path().join("soul.toml")).unwrap(),
+            Some(saved),
+            "Enter keeps each current value"
+        );
     }
 
     #[tokio::test]

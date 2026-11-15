@@ -8,6 +8,7 @@ access, API keys or an installed CLI.
 - **cradle-config**: detecting `.agents/` vs `agents.toml` (and the clash); loading this
   repository's own `.agents/`; both forms; mode tables, `[extra]` forms, mode commands
   and path resolution (escapes rejected); skills and front matter; `config.toml` round trip;
+  `soul.toml` round trip, partial files and bad values, project `soul.toml` / `[soul]`;
   `theme.toml` parsing (all value forms, per-entry warnings, invalid TOML, overlay).
 - **cradle-provider-spec**: validation errors (duplicate `id`, unknown `kind`, bad URL,
   `default_model` not in `models`, fields not allowed for a kind, `prompt_caching` on
@@ -22,15 +23,18 @@ access, API keys or an installed CLI.
   context and separators, `var_replace`, `var_lines` order, output cap).
 - **cradle-mcp**: the server over a real local socket: initialize, list and call (routed
   to the channel); refusal without the token or with an `Origin`; unknown tools.
-- **cradle-core**: trust snapshot hash stability, diff and store round trip; mode
+- **cradle-core**: trust snapshot hash stability, diff and store round trip (project
+  preferences in the snapshot, stored preference choices); preference resolution; mode
   resolution and clashes; reviewer verdict parsing (missing or garbled means unsure);
-  prompt assembly; session log write, list and resume; `ask_user` answer formatting.
+  prompt assembly (including each preference band); session log write, list and resume;
+  `ask_user` answer formatting.
 - **cradle** (bin): theme presets (complete and valid, the dark preset matches the
   original colours and is the `--example` output, roles cascade, palette names resolve,
   bad values keep the preset, optional background); slash command suggestions, model
   picker, markdown rendering, text wrapping, tool cards, and TUI behaviour driven by key
   events (Tab/Shift+Tab mode cycling, input history, sidebar, approvals with requested
-  changes, grouped tool calls, multi-question stepping and dismissal, `/theme reload`).
+  changes, grouped tool calls, multi-question stepping and dismissal, `/theme reload`,
+  `/preferences` stepping and saving); preference answers and typed answers.
 
 ## Integration tests
 
@@ -49,6 +53,9 @@ rules whatever the model asks for:
 - `read_files` returns every file and reports per-file failures
 - `save_as` returns a summary instead of the result; `var_*` tools filter saved results
   in plan mode; unknown variables are errors
+- preferences are announced once and again after a change; project preferences apply
+  only when picked and the choice is remembered; `auto_verify` runs build/test once after
+  edits, and reports a failed build to the model
 
 ## Rules for new tests
 

@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use crate::modes::ModesTables;
+use crate::soul::SoulPatch;
 use crate::{AGENTS_DIR, ConfigError, Docs, Entry, EntryBody, ProjectConfig, SourceKind};
 
 pub(crate) fn is_directory_form(dir: &Path) -> Result<bool, ConfigError> {
@@ -37,6 +38,12 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
     };
     let (modes, commands) = tables.resolve(&dir, &modes_path)?;
 
+    let soul_path = dir.join("soul.toml");
+    let soul = match read_optional(&soul_path)? {
+        Some(src) => SoulPatch::parse(&src, &soul_path)?,
+        None => SoulPatch::default(),
+    };
+
     Ok(ProjectConfig {
         root: root.to_owned(),
         source: SourceKind::Directory,
@@ -55,6 +62,7 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
         modes,
         commands,
         skills: crate::skills::list(&dir.join("skills"))?,
+        soul,
     })
 }
 
@@ -124,5 +132,21 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(load(tmp.path()), Err(ConfigError::Toml { .. })));
+    }
+
+    #[test]
+    fn loads_and_checks_soul_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".agents");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(load(tmp.path()).unwrap().soul.is_empty());
+
+        fs::write(dir.join("soul.toml"), "audience = \"non-technical\"").unwrap();
+        let soul = load(tmp.path()).unwrap().soul;
+        assert_eq!(soul.audience, Some(crate::soul::Audience::NonTechnical));
+        assert_eq!(soul.questions, None);
+
+        fs::write(dir.join("soul.toml"), "questions = 12").unwrap();
+        assert!(matches!(load(tmp.path()), Err(ConfigError::Invalid { .. })));
     }
 }

@@ -22,6 +22,9 @@
 //!
 //! [build_mode.commands]              # run without approval in build mode, once reviewed
 //! check = "cargo check"
+//!
+//! [soul]                             # preferences; the user picks these over their own
+//! audience = "non-technical"
 //! ```
 
 use std::collections::BTreeMap;
@@ -32,6 +35,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::modes::{DefaultModes, ExtraMode, ModeTable, ModesTables};
+use crate::soul::SoulPatch;
 use crate::{
     AGENTS_DIR, AGENTS_TOML, ConfigError, Docs, Entry, EntryBody, ProjectConfig, SourceKind,
 };
@@ -56,6 +60,8 @@ struct AgentsToml {
     extra: BTreeMap<String, ExtraMode>,
     #[serde(default)]
     commands: BTreeMap<String, String>,
+    #[serde(default)]
+    soul: SoulPatch,
     #[serde(flatten)]
     mode_tables: BTreeMap<String, ModeTable>,
 }
@@ -77,6 +83,7 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
         path: path.clone(),
         source,
     })?;
+    parsed.soul.validate(&path)?;
 
     let tables = ModesTables {
         default: parsed.default,
@@ -119,6 +126,7 @@ pub(crate) fn load(root: &Path) -> Result<ProjectConfig, ConfigError> {
         modes,
         commands,
         skills: crate::skills::list(&root.join(AGENTS_DIR).join("skills"))?,
+        soul: parsed.soul,
     })
 }
 
@@ -186,6 +194,9 @@ mod tests {
 
             [plan_mode.commands]
             check = "cargo check"
+
+            [soul]
+            questions = 8
             "#,
         )
         .unwrap();
@@ -211,6 +222,16 @@ mod tests {
         assert_eq!(config.modes.clash_handler, crate::ClashHandler::Combine);
         assert_eq!(config.commands["test"], "cargo test");
         assert_eq!(config.modes.commands["plan"]["check"], "cargo check");
+        assert_eq!(config.soul.questions, Some(8));
+    }
+
+    #[test]
+    fn checks_the_soul_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agents.toml"), "[soul]\nquestions = 0").unwrap();
+        assert!(matches!(load(tmp.path()), Err(ConfigError::Invalid { .. })));
+        fs::write(tmp.path().join("agents.toml"), "[soul]\nmood = \"happy\"").unwrap();
+        assert!(matches!(load(tmp.path()), Err(ConfigError::Toml { .. })));
     }
 
     #[test]

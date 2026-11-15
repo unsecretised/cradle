@@ -3,13 +3,15 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cradle_backends::Backend;
 use cradle_config::SourceKind;
+use cradle_config::soul::{Audience, Soul};
 use cradle_core::{
-    AgentCommand, AgentEvent, AgentHandle, AgentSetup, Approval, ClashChoice, ModeSet, ReviewPolicy,
+    AgentCommand, AgentEvent, AgentHandle, AgentSetup, Answer, Approval, ClashChoice, ModeSet,
+    ReviewPolicy,
 };
 use cradle_provider_spec::{
     Auth, Backend as SpecBackend, Capabilities, HttpApi, HttpProvider, ProviderSpec,
@@ -133,6 +135,17 @@ fn mode_review(verdicts: Value) -> String {
 }
 
 fn start(url: &str, root: &Path, mode: &str, review: ReviewPolicy) -> AgentHandle {
+    start_with(url, root, mode, review, Soul::default(), None)
+}
+
+fn start_with(
+    url: &str,
+    root: &Path,
+    mode: &str,
+    review: ReviewPolicy,
+    soul: Soul,
+    trust_store: Option<PathBuf>,
+) -> AgentHandle {
     let spec = ProviderSpec {
         id: "fake".into(),
         backend: SpecBackend::Http(HttpProvider {
@@ -162,8 +175,9 @@ fn start(url: &str, root: &Path, mode: &str, review: ReviewPolicy) -> AgentHandl
         history: vec![],
         session: None,
         data_dir: None,
-        trust_store: None,
+        trust_store,
         global_modes: None,
+        soul,
     })
 }
 
@@ -661,6 +675,184 @@ async fn unchanged_config_is_not_asked_about() {
     );
     let second = &requests.lock().unwrap()[1];
     assert!(second["system"].to_string().contains("v2 product"));
+}
+
+/// How many messages in request `i` contain `needle`.
+fn count_messages(requests: &Mutex<Vec<Value>>, i: usize, needle: &str) -> usize {
+    let requests = requests.lock().unwrap();
+    requests[i]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m.to_string().contains(needle))
+        .count()
+}
+
+#[tokio::test]
+async fn preferences_are_announced_once_and_again_when_changed() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    let (url, requests) = fake_server(vec![text("ok"), text("ok"), text("ok")]).await;
+    let mut agent = start(&url, tmp.path(), "plan", ReviewPolicy::User);
+
+    turn(&mut agent, "one", Approval::No).await;
+    turn(&mut agent, "two", Approval::No).await;
+    assert_eq!(count_messages(&requests, 0, "User preferences"), 1);
+    assert_eq!(
+        count_messages(&requests, 1, "User preferences"),
+        1,
+        "not repeated while unchanged"
+    );
+    assert_eq!(count_messages(&requests, 1, "Questions (5 of 10)"), 1);
+
+    agent
+        .commands
+        .send(AgentCommand::SetSoul(Soul {
+            questions: 9,
+            audience: Audience::NonTechnical,
+            ..Soul::default()
+        }))
+        .unwrap();
+    turn(&mut agent, "three", Approval::No).await;
+    assert_eq!(count_messages(&requests, 2, "Questions (9 of 10)"), 1);
+    assert_eq!(count_messages(&requests, 2, "plain language"), 1);
+}
+
+#[tokio::test]
+async fn project_preferences_apply_only_when_the_user_picks_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    project(tmp.path());
+    fs::write(
+        tmp.path().join(".agents/soul.toml"),
+        "questions = 9\naudience = \"non-technical\"\n",
+    )
+    .unwrap();
+    let store = tmp.path().join("cfg/trust.toml");
+    let (url, requests) = fake_server(vec![text("ok"), text("ok")]).await;
+    let mut agent = start_with(
+        &url,
+        tmp.path(),
+        "plan",
+        ReviewPolicy::User,
+        Soul::default(),
+        Some(store.clone()),
+    );
+
+    // Pick the project's questions value and keep our own audience.
+    agent
+        .commands
+        .send(AgentCommand::Send("one".into()))
+        .unwrap();
+    let mut asked = Vec::new();
+    while let Some(event) = agent.events.recv().await {
+        match event {
+            AgentEvent::Question(req) => {
+                let answers = req
+                    .questions
+                    .iter()
+                    .map(|q| {
+                        asked.push(q.question.clone());
+                        let pick = if q.question.contains("asks you questions") {
+                            0
+                        } else {
+                            1
+                        };
+                        Answer::Choice(q.options[pick].clone())
+                    })
+                    .collect();
+                req.reply.send(answers).unwrap();
+            }
+            AgentEvent::TurnFinished => break,
+            _ => {}
+        }
+    }
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(count_messages(&requests, 0, "Questions (9 of 10)"), 1);
+    assert_eq!(count_messages(&requests, 0, "precise technical terms"), 1);
+
+    // Remembered: not asked again.
+    let mut asked_again = false;
+    agent
+        .commands
+        .send(AgentCommand::Send("two".into()))
+        .unwrap();
+    while let Some(event) = agent.events.recv().await {
+        match event {
+            AgentEvent::Question(_) => asked_again = true,
+            AgentEvent::TurnFinished => break,
+            _ => {}
+        }
+    }
+    assert!(!asked_again);
+    assert!(fs::read_to_string(&store).unwrap().contains("questions"));
+}
+
+#[tokio::test]
+async fn auto_verify_reports_a_failed_build_to_the_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[commands]\nbuild = \"false\"\ntest = \"touch tested.txt\"\n",
+    );
+    let (url, requests) = fake_server(vec![
+        tool_call("t1", "write_file", json!({"path": "a.txt", "content": "a"})),
+        text("done"),
+        text("fixed"),
+    ])
+    .await;
+    let soul = Soul {
+        auto_verify: true,
+        ..Soul::default()
+    };
+    let mut agent = start_with(&url, tmp.path(), "build", ReviewPolicy::User, soul, None);
+
+    let asked = turn_approvals(&mut agent, "write a", Approval::Yes).await;
+
+    let titles: Vec<&str> = asked.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(titles, ["Create a.txt?", "Run `build`?"]);
+    assert!(
+        !tmp.path().join("tested.txt").exists(),
+        "test doesn't run after a failed build"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "one more model call to fix it");
+    let last = requests[2]["messages"].as_array().unwrap().last().unwrap();
+    assert!(last.to_string().contains("`build` failed"), "{last}");
+}
+
+#[tokio::test]
+async fn auto_verify_runs_build_and_test_once_after_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    project_with(
+        tmp.path(),
+        "[commands]\nbuild = \"touch built.txt\"\ntest = \"touch tested.txt\"\n",
+    );
+    let (url, requests) = fake_server(vec![
+        tool_call("t1", "write_file", json!({"path": "a.txt", "content": "a"})),
+        text("done"),
+        text("just chatting"),
+    ])
+    .await;
+    let soul = Soul {
+        auto_verify: true,
+        ..Soul::default()
+    };
+    let mut agent = start_with(&url, tmp.path(), "build", ReviewPolicy::User, soul, None);
+
+    let asked = turn_approvals(&mut agent, "write a", Approval::Yes).await;
+    assert_eq!(asked.len(), 3, "the write, build and test");
+    assert!(tmp.path().join("built.txt").exists());
+    assert!(tmp.path().join("tested.txt").exists());
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "passing checks need no model call"
+    );
+
+    fs::remove_file(tmp.path().join("built.txt")).unwrap();
+    let asked = turn_approvals(&mut agent, "hello", Approval::Yes).await;
+    assert!(asked.is_empty(), "nothing changed: no checks");
+    assert!(!tmp.path().join("built.txt").exists());
 }
 
 #[tokio::test]

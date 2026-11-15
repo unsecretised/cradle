@@ -18,12 +18,12 @@ Implemented features, with details in `features/`.
 | [SESSIONS](features/FEATURE_SESSIONS.md) | JSONL transcripts, `--continue`, `/session` |
 | [TUI](features/FEATURE_TUI.md) | ratatui interface: setup screen, approvals, diffs, sidebar, slash commands |
 | [THEME](features/FEATURE_THEME.md) | Global `theme.toml`: dark/light presets, palette, roles, per-element styles, `/theme reload` |
+| [SOUL](features/FEATURE_SOUL.md) | Preferences (`soul.toml`, `/preferences`): questions 1-10, audience, detail, `auto_verify`; project values only when the user picks them |
 
 ## Roadmap
 
 | Item | Summary |
 |---|---|
-| [SOUL](roadmap/FEATURE_SOUL.md) | Global behaviour preferences; project override with approval |
 | [DOC_PROPOSALS](roadmap/FEATURE_DOC_PROPOSALS.md) | Batched `.agents/` proposals (approved per-write edits already exist) |
 | [SANDBOX](roadmap/FEATURE_SANDBOX.md) | Sandbox for `[commands]` |
 | [ACP_AGENT](roadmap/FEATURE_ACP_AGENT.md) | Later: run Cradle inside ACP editors |

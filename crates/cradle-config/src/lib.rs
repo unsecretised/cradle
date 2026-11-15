@@ -10,6 +10,7 @@ mod error;
 mod modes;
 pub mod paths;
 mod skills;
+pub mod soul;
 pub mod theme;
 pub mod user;
 
@@ -55,6 +56,8 @@ pub struct ProjectConfig {
     pub commands: BTreeMap<String, String>,
     /// Skills in `.agents/skills/`.
     pub skills: Vec<Skill>,
+    /// Preferences the project sets (`.agents/soul.toml` or `[soul]`). Empty if none.
+    pub soul: soul::SoulPatch,
 }
 
 /// The single-document sections. All optional: a project may leave any of them out.

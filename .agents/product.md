@@ -14,9 +14,10 @@ project and keeps that agent inside rules the project and the user define.
   or opens PRs on its own.
 - **Project config has to be trusted.** Modes, commands and soul overrides from a project are
   shown to the user for approval, and approved again whenever they change.
-- **Soul (planned).** User-level behaviour preferences (ask more or fewer questions, verify builds
-  automatically, technical vs. non-technical audience). A project can override them, with
-  the user's approval.
+- **Soul (Preferences).** User-level behaviour preferences: how often to ask questions (1-10),
+  technical vs. non-technical audience, concise vs. detailed explanations, and verifying
+  builds automatically. Set during setup or with `/preferences`. A project can suggest its
+  own values; each one applies only if the user picks it.
 - **Custom modes.** Plan and build are the defaults, and a project can add its own (e.g. a
   debug mode). `clash_handler` decides how project modes interact with the user's global
   modes. A built-in scaffold mode sets up `.agents/` for a new project.
@@ -33,6 +34,6 @@ knowledge kept in a structured form that both people and agents can maintain.
 
 ## Status
 
-Pre-alpha, but usable: the workspace, TUI, all four backend kinds, trust, modes, sessions
-and skills are implemented (see `features.md`). Not started yet: Soul, a command sandbox and
-the ACP front end (see `roadmap/`).
+Pre-alpha, but usable: the workspace, TUI, all four backend kinds, trust, modes, sessions,
+skills and preferences (Soul) are implemented (see `features.md`). Not started yet: a
+command sandbox and the ACP front end (see `roadmap/`).

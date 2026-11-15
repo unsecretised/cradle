@@ -7,6 +7,7 @@ pub mod modes;
 pub mod prompt;
 pub mod review;
 pub mod session;
+pub mod soul;
 pub mod trust;
 
 pub use agent::{

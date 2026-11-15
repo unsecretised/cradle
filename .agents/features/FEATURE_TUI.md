@@ -7,7 +7,8 @@ Model output is rendered as markdown with pulldown-cmark.
 
 - **Setup screen** (`onboard.rs`): choose a provider, enter an API key if needed (saved to
   the keychain), choose a model. Shown on first run, when the saved provider is unusable,
-  and with `--setup`. The choice is saved to `~/.config/cradle/config.toml`.
+  and with `--setup`. The choice is saved to `~/.config/cradle/config.toml`. The
+  preferences questions follow (see `FEATURE_SOUL.md`).
 - **Conversation**: messages, and tool call cards (`tools.rs`). Consecutive reads, lists
   and searches are grouped and can be expanded (Ctrl+O).
 - **Approvals**: diffs for writes and config changes, command approvals, and `ask_user`
@@ -29,8 +30,8 @@ Model output is rendered as markdown with pulldown-cmark.
 
 `/help`, `/clear`, `/mode [name]`, `/plan`, `/build`, `/model [provider/model]` (also
 switches provider; model picker in `picker.rs`), `/review user|subagent`, `/diff`,
-`/session`, `/sidebar`, `/skill <name> [request]`, `/theme [reload]`, `/quit`. Aliases: `/models`,
-`/sessions`, `/resume`, `/skills`, `/exit`. Suggestions appear while typing, and Tab
+`/session`, `/sidebar`, `/skill <name> [request]`, `/theme [reload]`, `/preferences`, `/quit`.
+Aliases: `/models`, `/sessions`, `/resume`, `/skills`, `/soul`, `/exit`. Suggestions appear while typing, and Tab
 completes them.
 
 ## Keys

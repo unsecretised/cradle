@@ -10,7 +10,7 @@ pub struct CommandInfo {
 }
 
 /// Every command, in the order shown. Aliases (`/models`, `/sessions`, `/resume`,
-/// `/skills`, `/exit`) work but aren't listed.
+/// `/skills`, `/soul`, `/exit`) work but aren't listed.
 pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "help",
@@ -85,6 +85,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         needs_arg: false,
     },
     CommandInfo {
+        name: "preferences",
+        args: "",
+        description: "how the agent works with you: questions, technical terms, checks",
+        needs_arg: false,
+    },
+    CommandInfo {
         name: "quit",
         args: "",
         description: "exit cradle",
@@ -98,6 +104,7 @@ pub fn canonical(name: &str) -> &str {
         "models" => "model",
         "sessions" | "resume" => "session",
         "skills" => "skill",
+        "soul" => "preferences",
         "exit" => "quit",
         other => other,
     }

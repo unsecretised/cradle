@@ -11,6 +11,8 @@
 //!   blocked for the session, by command line. Read-only modes may run only these.
 //! - Project config is reloaded before every message. A changed config applies only once
 //!   the user trusts it, after seeing the diff.
+//! - A project preference that differs from the user's applies only once the user picks
+//!   it. With `auto_verify`, `build`/`test` run after edits, through the usual approvals.
 //! - History is append-only, which the API's thinking blocks require.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -21,6 +23,7 @@ use cradle_backends::{
     AgentTurn, Backend, Block, McpEndpoint, Message, ModelRequest, Role, StopReason, StreamEvent,
     ToolSpec, Usage,
 };
+use cradle_config::soul::{Soul, SoulKey, SoulPatch};
 use cradle_config::{Detection, ModeAccess, ProjectConfig, SourceKind};
 use cradle_mcp::{McpServer, McpTool, ToolReply, ToolRequest};
 use cradle_tools::hygiene::reveal_invisible;
@@ -35,10 +38,13 @@ use crate::modes::{ClashChoice, FileEdits, ModeSet, SCAFFOLD_MODE};
 use crate::prompt;
 use crate::review::{self, ChangedFile, Verdict};
 use crate::session::SessionLog;
+use crate::soul::{self as prefs, SoulChoice};
 use crate::trust::{self, TrustStore};
 
 const MAX_TOKENS: u32 = 64_000;
 const PREVIEW_LINES: usize = 4;
+/// What `auto_verify` runs, in order, if the project has them.
+const VERIFY_COMMANDS: [&str; 2] = ["build", "test"];
 
 /// Who approves `run_command`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +198,8 @@ pub enum AgentCommand {
     LoadSession(PathBuf),
     /// Switch model or provider. The conversation continues on the new model.
     SetBackend(Box<Backend>),
+    /// The user changed their preferences. They apply from the next message.
+    SetSoul(Soul),
 }
 
 pub struct AgentSetup {
@@ -212,6 +220,8 @@ pub struct AgentSetup {
     pub trust_store: Option<PathBuf>,
     /// The user's global modes (`~/.config/cradle/modes/`), for re-resolving modes.
     pub global_modes: Option<PathBuf>,
+    /// The user's own preferences (`~/.config/cradle/soul.toml`, or the defaults).
+    pub soul: Soul,
 }
 
 pub struct AgentHandle {
@@ -289,6 +299,18 @@ struct Agent {
     failed_parts: Vec<String>,
     /// Tool results saved with `save_as` in this conversation.
     vars: VarStore,
+    /// The user's own preferences.
+    user_soul: Soul,
+    /// The preferences that apply: the user's, with project values they picked.
+    soul: Soul,
+    /// The preferences the model was last told about in this conversation.
+    announced_soul: Option<Soul>,
+    /// Files changed since the user's last message, for `auto_verify`.
+    edited: bool,
+    /// `auto_verify` already ran for the user's last message.
+    verified: bool,
+    /// Automatic check runs so far, for tool card ids.
+    verify_runs: usize,
     events: mpsc::UnboundedSender<AgentEvent>,
     cancel: Arc<Notify>,
 }
@@ -313,11 +335,11 @@ impl Agent {
         });
         // Without a trusted project, any config on disk was declined at startup (or there
         // is none). Don't ask about it again until it changes.
+        let store = setup
+            .trust_store
+            .as_ref()
+            .and_then(|p| TrustStore::load(p.clone()).ok());
         let declined_hash = if setup.project.is_none() {
-            let store = setup
-                .trust_store
-                .as_ref()
-                .and_then(|p| TrustStore::load(p.clone()).ok());
             load_project(setup.guard.root(), store.as_ref(), None)
                 .ok()
                 .flatten()
@@ -325,6 +347,13 @@ impl Agent {
         } else {
             None
         };
+        // Undecided project preferences are asked about with the first message.
+        let (soul, _) = resolve_soul(
+            &setup.soul,
+            setup.project.as_ref(),
+            setup.guard.root(),
+            store.as_ref(),
+        );
 
         let mut history = setup.history;
         close_dangling_tool_calls(&mut history);
@@ -361,6 +390,12 @@ impl Agent {
             edits_allowed: false,
             failed_parts: Vec::new(),
             vars: VarStore::default(),
+            user_soul: setup.soul,
+            soul,
+            announced_soul: None,
+            edited: false,
+            verified: false,
+            verify_runs: 0,
             events,
             cancel,
         }
@@ -428,6 +463,7 @@ impl Agent {
                         // A CLI's session id means nothing to another provider.
                         self.cli_session = None;
                         self.announced_mode = None;
+                        self.announced_soul = None;
                         if backend.is_cli() && !self.history.is_empty() {
                             self.emit(AgentEvent::Notice(format!(
                                 "{} starts a fresh session: earlier messages are not sent.",
@@ -450,10 +486,22 @@ impl Agent {
                         model: self.backend.model().to_owned(),
                     });
                 }
+                AgentCommand::SetSoul(soul) => {
+                    self.user_soul = soul;
+                    let store = self.load_store();
+                    self.soul = resolve_soul(
+                        &self.user_soul,
+                        self.project.as_ref(),
+                        self.guard.root(),
+                        store.as_ref(),
+                    )
+                    .0;
+                }
                 AgentCommand::Clear => {
                     self.history.clear();
                     self.vars.clear();
                     self.announced_mode = None;
+                    self.announced_soul = None;
                     self.cli_session = None;
                     self.reset_mode_reviews();
                     if let (Some(dir), Some(_)) = (&self.data_dir, &self.session) {
@@ -474,6 +522,7 @@ impl Agent {
                         self.history = history;
                         self.vars.clear();
                         self.announced_mode = None;
+                        self.announced_soul = None;
                         self.cli_session = None;
                         self.reset_mode_reviews();
                         self.emit(AgentEvent::SessionLoaded(self.history.clone()));
@@ -678,6 +727,14 @@ impl Agent {
         self.project = project;
         self.applied = applied;
         self.declined_hash = None;
+        // New project preferences are asked about before the message goes out.
+        self.soul = resolve_soul(
+            &self.user_soul,
+            self.project.as_ref(),
+            self.guard.root(),
+            store.as_ref(),
+        )
+        .0;
 
         let modes = self
             .modes
@@ -744,6 +801,164 @@ impl Agent {
             let _ = store.set_clash_choice(root, choice);
         }
         choice
+    }
+
+    fn load_store(&self) -> Option<TrustStore> {
+        self.trust_store
+            .as_ref()
+            .and_then(|p| TrustStore::load(p.clone()).ok())
+    }
+
+    /// Ask about project preferences that differ from the user's own and haven't been
+    /// decided (or whose project value changed). The answers are stored per project.
+    /// Dismissed: the user's own values apply, and Cradle asks again next message.
+    /// Returns `false` if the user cancelled.
+    async fn settle_soul(&mut self) -> bool {
+        let mut store = self.load_store();
+        let root = self.guard.root().to_path_buf();
+        let (soul, open) = resolve_soul(
+            &self.user_soul,
+            self.project.as_ref(),
+            &root,
+            store.as_ref(),
+        );
+        self.soul = soul;
+        if open.is_empty() {
+            return true;
+        }
+        let patch = self
+            .project
+            .as_ref()
+            .map(|p| p.soul.clone())
+            .unwrap_or_default();
+        let questions = open
+            .iter()
+            .map(|key| prefs::question(*key, &self.user_soul, &patch))
+            .collect();
+        let (reply, answer) = oneshot::channel();
+        self.emit(AgentEvent::Question(QuestionRequest { questions, reply }));
+        let cancel = self.cancel.clone();
+        let answers = tokio::select! {
+            answers = answer => answers,
+            _ = cancel.notified() => return false,
+        };
+        let Ok(answers) = answers else {
+            self.emit(AgentEvent::Notice(
+                "Using your own preferences for now; Cradle asks about the project's again with \
+                 your next message."
+                    .into(),
+            ));
+            return true;
+        };
+        let theirs = self.user_soul.with(&patch);
+        for (key, answer) in open.iter().zip(&answers) {
+            let [use_project, _] = prefs::options(*key, &self.user_soul, &patch);
+            let choice = match answer {
+                Answer::Choice(c) if *c == use_project => SoulChoice::Project,
+                _ => SoulChoice::Mine,
+            };
+            if choice == SoulChoice::Project {
+                self.soul.take(*key, &theirs);
+            }
+            if let Some(store) = store.as_mut()
+                && let Err(e) = store.set_soul_choice(&root, *key, &theirs.value(*key), choice)
+            {
+                self.emit(AgentEvent::Error(format!(
+                    "cannot save the choice (it applies to this session only): {e}"
+                )));
+            }
+        }
+        true
+    }
+
+    /// Tell the model the preferences if it doesn't know the current ones. Returns the
+    /// message.
+    fn announce_soul(&mut self) -> Option<String> {
+        if self.announced_soul == Some(self.soul) {
+            return None;
+        }
+        let message = prompt::soul_message(&self.soul);
+        self.push(Message::system(message.clone()));
+        self.announced_soul = Some(self.soul);
+        Some(message)
+    }
+
+    /// With `auto_verify` on, after a reply that changed files: run the project's `build`
+    /// and `test` commands (the ones that exist), through the usual approvals. Once per user
+    /// message. Returns a report for the model if a check failed; a command that didn't
+    /// run (declined, blocked) just ends the check.
+    async fn auto_verify(&mut self) -> Option<String> {
+        if !self.soul.auto_verify || !self.edited || self.verified {
+            return None;
+        }
+        let mode = self.modes.get(&self.mode)?;
+        if mode.access != ModeAccess::Full {
+            return None;
+        }
+        let names: Vec<&str> = VERIFY_COMMANDS
+            .into_iter()
+            .filter(|n| self.commands.contains_key(*n) || mode.commands.contains_key(*n))
+            .collect();
+        self.verified = true;
+        if names.is_empty() {
+            self.emit(AgentEvent::Notice(
+                "auto_verify is on, but this project has no `build` or `test` command.".into(),
+            ));
+            return None;
+        }
+
+        const REASON: &str =
+            "Automatic check after file changes (auto_verify in your preferences).";
+        let cancel = self.cancel.clone();
+        let mut passed = Vec::new();
+        for name in names {
+            self.verify_runs += 1;
+            let id = format!("verify-{}", self.verify_runs);
+            let call = ToolCall::RunCommand {
+                name: name.to_owned(),
+                reason: REASON.to_owned(),
+            };
+            self.emit(AgentEvent::ToolStarted {
+                id: id.clone(),
+                summary: format!("{} (auto_verify)", call.summary()),
+                activity: Some(call.activity()),
+            });
+            let outcome = tokio::select! {
+                outcome = self.run_command(name, REASON) => outcome,
+                _ = cancel.notified() => Err(ToolError::new("Cancelled.")),
+            };
+            // A failing command still reports (non-zero exit); `Err` means it didn't run.
+            let (text, ran) = match outcome {
+                Ok(report) => (report, true),
+                Err(e) => (e.0, false),
+            };
+            let ok = ran && text.starts_with("exit code 0");
+            self.emit(AgentEvent::ToolFinished {
+                id,
+                ok,
+                preview: preview(&text),
+                failed: Vec::new(),
+            });
+            if !ran {
+                self.emit(AgentEvent::Notice(format!(
+                    "auto_verify stopped: `{name}` did not run."
+                )));
+                return None;
+            }
+            if !ok {
+                return Some(format!(
+                    "Automatic check after your changes (auto_verify): `{name}` failed.\n\n\
+                     {text}\n\nFix the cause, then summarise what you changed. The check does \
+                     not run again for this message."
+                ));
+            }
+            passed.push(format!("`{name}`"));
+        }
+        self.emit(AgentEvent::Notice(format!(
+            "auto_verify: {} passed.",
+            passed.join(" and ")
+        )));
+        None
     }
 
     /// On the first message in a mode, have the reviewer check the mode's own commands.
@@ -827,13 +1042,27 @@ impl Agent {
 
     /// A turn through a CLI backend: the CLI runs the loop, and its tool calls arrive on
     /// the MCP server while it runs. Each goes through the same checks as API turns.
-    async fn run_cli_turn(&mut self, text: String) {
-        self.push(Message::user(text.clone()));
-        let mut prompt = String::new();
-        if let Some(notice) = self.announce_mode() {
-            prompt = format!("<harness_notice>\n{notice}\n</harness_notice>\n\n");
+    /// `from_harness`: `text` is a harness message (an `auto_verify` report), not the user's.
+    async fn run_cli_turn(&mut self, text: String, from_harness: bool) {
+        let mut notices = Vec::new();
+        if from_harness {
+            self.push(Message::system(text.clone()));
+            notices.push(text.clone());
+        } else {
+            self.push(Message::user(text.clone()));
         }
-        prompt.push_str(&text);
+        notices.extend(self.announce_mode());
+        notices.extend(self.announce_soul());
+        let mut prompt = String::new();
+        if !notices.is_empty() {
+            prompt = format!(
+                "<harness_notice>\n{}\n</harness_notice>\n\n",
+                notices.join("\n\n")
+            );
+        }
+        if !from_harness {
+            prompt.push_str(&text);
+        }
 
         let Some((server, mut calls)) = self.mcp.take() else {
             self.emit(AgentEvent::Error(
@@ -922,15 +1151,22 @@ impl Agent {
     }
 
     async fn run_turn(&mut self, text: String) {
-        if !self.reload_config().await || !self.review_mode().await {
+        if !self.reload_config().await || !self.review_mode().await || !self.settle_soul().await {
             self.emit(AgentEvent::Notice("Cancelled.".into()));
             return;
         }
+        self.edited = false;
+        self.verified = false;
         if self.backend.is_cli() {
-            return self.run_cli_turn(text).await;
+            self.run_cli_turn(text, false).await;
+            if let Some(report) = self.auto_verify().await {
+                self.run_cli_turn(report, true).await;
+            }
+            return;
         }
         self.push(Message::user(text));
         self.announce_mode();
+        self.announce_soul();
 
         let cancel = self.cancel.clone();
         loop {
@@ -991,7 +1227,12 @@ impl Agent {
                     StopReason::MaxTokens => self.emit(AgentEvent::Notice(
                         "The response was cut off (max tokens).".into(),
                     )),
-                    _ => {}
+                    _ => {
+                        if let Some(report) = self.auto_verify().await {
+                            self.push(Message::system(report));
+                            continue;
+                        }
+                    }
                 }
                 return;
             }
@@ -1308,6 +1549,7 @@ impl Agent {
                 .insert(rel.clone(), (write.target.abs.clone(), before));
         }
         let summary = cradle_tools::fs::apply(&write)?;
+        self.edited = true;
 
         if let WriteClass::Protected(_) = write.class {
             self.protected_changed.insert(rel.clone());
@@ -1508,6 +1750,21 @@ impl Agent {
             read_only: mode.access == ModeAccess::Read,
         });
     }
+}
+
+/// The preferences that apply for `project`, using the user's stored choices, and the
+/// project preferences still to ask about.
+fn resolve_soul(
+    user: &Soul,
+    project: Option<&ProjectConfig>,
+    root: &Path,
+    store: Option<&TrustStore>,
+) -> (Soul, Vec<SoulKey>) {
+    let empty = SoulPatch::default();
+    let patch = project.map_or(&empty, |p| &p.soul);
+    prefs::resolve(user, patch, |key, value| {
+        store.and_then(|s| s.soul_choice(root, key, value))
+    })
 }
 
 /// The tool definitions for a project. `run_command` lists `[commands]` and every mode's

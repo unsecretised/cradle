@@ -34,14 +34,17 @@ cradle-backends (build.rs) ─► cradle-provider-spec   [build-dependency]
 - **cradle** (bin): `main.rs` (clap: run, `providers`, `config`, `theme`), `setup.rs`
   (trust and clash prompts on stdin, session, backend choice), `inspect.rs`, `tui/`
   (`mod.rs` app state, `view.rs`, `commands.rs` slash commands, `onboard.rs` setup screen,
-  `picker.rs` model picker, `markdown.rs`, `tools.rs` tool cards, `text.rs` input,
-  `theme.rs` + `themes/` colour presets).
+  `picker.rs` model picker, `questions.rs` question modal, `preferences.rs` `/preferences`,
+  `markdown.rs`, `tools.rs` tool cards, `text.rs` input, `theme.rs` + `themes/` colour
+  presets).
 - **cradle-core**: `agent.rs` (the loop, run on its own task, talking to the UI over
   channels; enforces mode access, approvals and trust), `modes.rs` (`ModeSet`: built-in, global
-  and project modes), `prompt.rs`, `review.rs` (reviewer subagent), `session.rs`, `trust.rs`.
+  and project modes), `prompt.rs`, `review.rs` (reviewer subagent), `session.rs`, `trust.rs`,
+  `soul.rs` (which preferences apply: the user's, or the project's where picked).
   Built-in mode prompts are in `modes/` and `prompts/`.
 - **cradle-config**: `directory.rs` and `agents_toml.rs` (the two forms), `modes.rs`,
-  `skills.rs`, `user.rs` (`config.toml`), `theme.rs` (`theme.toml`), `paths.rs`.
+  `skills.rs`, `user.rs` (`config.toml`), `soul.rs` (`soul.toml`), `theme.rs`
+  (`theme.toml`), `paths.rs`.
 - **cradle-tools**: `guard.rs` (`PathGuard`), `fs.rs`, `command.rs`, `specs.rs` (tool
   definitions and call parsing), `hygiene.rs`.
 - **cradle-backends**: `anthropic.rs`, `openai.rs`, `cli/` (Claude Code, Codex),
@@ -62,7 +65,8 @@ cradle-backends (build.rs) ─► cradle-provider-spec   [build-dependency]
   `PathGuard`. Policy (which mode may use which tool, approvals) lives in `cradle-core`.
 - **Prompt**: base rules + always-loaded `.agents/` docs + a list of on-demand docs and
   skills. It is built once per session and rebuilt only when project config is reloaded, so
-  the prompt cache stays warm. Mode changes are sent as mid-conversation system messages.
+  the prompt cache stays warm. Mode changes and preferences (`soul`) are sent as
+  mid-conversation system messages.
 
 ## Data locations
 
@@ -70,9 +74,10 @@ cradle-backends (build.rs) ─► cradle-provider-spec   [build-dependency]
 |---|---|
 | Default provider and model | `~/.config/cradle/config.toml` |
 | TUI theme | `~/.config/cradle/theme.toml` |
+| Preferences (soul) | `~/.config/cradle/soul.toml` |
 | Global modes | `~/.config/cradle/modes/<name>.md` |
 | Runtime providers overlay | `~/.config/cradle/providers.toml` |
-| Trust hashes, source and clash choices | `~/.config/cradle/trust.toml` |
+| Trust hashes, source, clash and preference choices | `~/.config/cradle/trust.toml` |
 | Approved config snapshots | `~/.config/cradle/trust/<hash>.txt` |
 | Sessions (JSONL) | `~/.local/share/cradle/sessions/<project-hash>/` |
 | API keys | Env var first, then OS keychain (service `cradle`) |

@@ -261,12 +261,13 @@ impl PathGuard {
     }
 }
 
-/// Project config the agent may never change: it decides which commands and modes the
-/// agent gets.
+/// Project config the agent may never change: it decides which commands, modes and
+/// preferences the agent gets.
 fn is_agents_config(rel: &Path) -> bool {
     rel == Path::new("agents.toml")
         || rel == Path::new(".agents/RULES.md")
         || rel == Path::new(".agents/modes.toml")
+        || rel == Path::new(".agents/soul.toml")
         || rel.starts_with(".agents/modes")
 }
 
@@ -371,6 +372,13 @@ mod tests {
             guard.resolve_write(".agents/RULES.md"),
             Err(GuardError::AgentsConfig(_))
         ));
+        assert!(
+            matches!(
+                guard.resolve_write(".agents/soul.toml"),
+                Err(GuardError::AgentsConfig(_))
+            ),
+            "project preferences are config"
+        );
         assert_eq!(
             guard.resolve_scaffold(".agents/RULES.md").unwrap().1,
             WriteClass::AgentsConfig,

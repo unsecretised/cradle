@@ -19,6 +19,11 @@ pub fn user_config() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
 
+/// Behaviour preferences: `<config_dir>/soul.toml`.
+pub fn soul() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("soul.toml"))
+}
+
 /// The TUI theme: `<config_dir>/theme.toml`.
 pub fn theme() -> Option<PathBuf> {
     config_dir().map(|d| d.join("theme.toml"))

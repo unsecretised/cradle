@@ -8,6 +8,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use cradle_backends::{Backend, Message};
+use cradle_config::soul::Soul;
 use cradle_config::user::UserConfig;
 use cradle_config::{Detection, ModeAccess, ProjectConfig, SourceKind, paths};
 use cradle_core::trust::{self, TrustStore};
@@ -31,6 +32,10 @@ pub struct Session {
     pub preselect: Option<String>,
     /// Where the setup screen saves the chosen default.
     pub user_config: Option<PathBuf>,
+    /// `~/.config/cradle/soul.toml`, where `/preferences` saves.
+    pub soul_path: Option<PathBuf>,
+    /// The user has no `soul.toml` yet.
+    pub soul_missing: bool,
 }
 
 /// Everything the agent needs except the backend.
@@ -45,6 +50,7 @@ pub struct AgentParts {
     pub data_dir: Option<PathBuf>,
     pub trust_store: Option<PathBuf>,
     pub global_modes: Option<PathBuf>,
+    pub soul: Soul,
 }
 
 impl AgentParts {
@@ -61,6 +67,7 @@ impl AgentParts {
             data_dir: self.data_dir,
             trust_store: self.trust_store,
             global_modes: self.global_modes,
+            soul: self.soul,
         }
     }
 }
@@ -90,6 +97,14 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
         None => UserConfig::default(),
     };
     let (backend, preselect) = choose_backend(args, &providers, &user);
+
+    let soul_path = paths::soul();
+    let soul = match &soul_path {
+        Some(path) => Soul::load(path)?,
+        None => None,
+    };
+    let soul_missing = soul_path.is_some() && soul.is_none();
+    let soul = soul.unwrap_or_default();
 
     let config_dir = paths::config_dir();
     let mut store = match &config_dir {
@@ -151,6 +166,8 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
         backend,
         preselect,
         user_config,
+        soul_path,
+        soul_missing,
         agent: AgentParts {
             guard,
             project,
@@ -162,6 +179,7 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
             data_dir,
             trust_store: config_dir.as_ref().map(|d| d.join("trust.toml")),
             global_modes,
+            soul,
         },
     })
 }
