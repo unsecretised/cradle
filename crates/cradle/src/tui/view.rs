@@ -646,9 +646,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal, theme: &Theme) {
                     ])
                 })
                 .collect();
+            // The id is for `cradle --resume <id>`.
+            let id = sessions
+                .get(*selected)
+                .map(|s| format!("id {} · ", s.id))
+                .unwrap_or_default();
             let block = Block::bordered()
                 .title(" Resume a conversation ")
-                .title_bottom(" ↑↓ choose · Enter resume · Esc cancel ")
+                .title_bottom(format!(" {id}↑↓ choose · Enter resume · Esc cancel "))
                 .border_style(theme.border)
                 .padding(ratatui::widgets::Padding::horizontal(1));
             frame.render_widget(Paragraph::new(lines).block(block), rect);

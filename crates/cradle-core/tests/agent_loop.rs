@@ -172,7 +172,7 @@ fn start_with(
         modes,
         mode: mode.into(),
         review,
-        history: vec![],
+        transcript: Default::default(),
         session: None,
         data_dir: None,
         trust_store,
@@ -918,4 +918,270 @@ async fn saved_results_are_summarised_and_filtered() {
     );
     // The UI shows where a result was saved.
     assert_eq!(started[0], "search /^fn / in . → $hits");
+}
+
+/// A stand-in for `claude` that records each call's `--resume` id and prompt (stdin) in
+/// `<dir>/calls/<n>/`, and answers like Claude Code with session `new-1` (or the one it
+/// resumed). Asked to resume `gone`, it fails before any output, as for an expired session.
+fn fake_claude(dir: &Path) -> String {
+    let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "2.1.311 (Claude Code)"; exit 0; fi
+resume=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--resume" ]; then resume="$arg"; fi
+  prev="$arg"
+done
+mkdir -p "LOG"
+n=$(ls "LOG" | wc -l | tr -d ' ')
+mkdir "LOG/$n"
+echo "$resume" > "LOG/$n/resume"
+cat > "LOG/$n/prompt"
+if [ "$resume" = "gone" ]; then
+  echo "No conversation found with session ID: gone" >&2
+  exit 1
+fi
+id="${resume:-new-1}"
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$id\"}"
+echo "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"$id\"}"
+"#;
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("claude");
+    let log = dir.join("calls");
+    fs::write(&path, script.replace("LOG", &log.to_string_lossy())).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// Each call the fake CLI received: the session it resumed ("" for none) and the prompt.
+fn cli_calls(dir: &Path) -> Vec<(String, String)> {
+    let log = dir.join("calls");
+    (0..)
+        .map(|n| log.join(n.to_string()))
+        .take_while(|call| call.exists())
+        .map(|call| {
+            (
+                fs::read_to_string(call.join("resume"))
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+                fs::read_to_string(call.join("prompt")).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A saved conversation on `fake-claude`, with `cli` as its CLI session if given.
+fn saved_transcript(dir: &Path, cli: Option<(&str, &str)>) -> PathBuf {
+    use cradle_backends::{Block, Message, Role};
+    use cradle_core::session::{CliSession, Meta, SavedBackend, SessionLog};
+
+    let path = dir.join("transcript.jsonl");
+    let mut log = SessionLog::open(path.clone()).unwrap();
+    log.append_meta(&Meta::Backend(SavedBackend {
+        provider: "fake-claude".into(),
+        model: "default".into(),
+    }))
+    .unwrap();
+    log.append(&Message::user("earlier question")).unwrap();
+    log.append(&Message {
+        role: Role::Assistant,
+        content: vec![Block::Text {
+            text: "earlier answer".into(),
+        }],
+    })
+    .unwrap();
+    if let Some((provider, id)) = cli {
+        log.append_meta(&Meta::CliSession(CliSession {
+            provider: provider.into(),
+            id: id.into(),
+        }))
+        .unwrap();
+    }
+    path
+}
+
+/// An agent on the fake `claude` (in `bin`), continuing the transcript at `path`.
+fn start_cli(root: &Path, bin: &Path, path: &Path) -> AgentHandle {
+    use cradle_core::session::{self, SessionLog};
+    use cradle_provider_spec::{CliAgent, CliProvider};
+
+    let spec = ProviderSpec {
+        id: "fake-claude".into(),
+        backend: SpecBackend::Cli(CliProvider {
+            agent: CliAgent::ClaudeCode,
+            binary: fake_claude(bin),
+            version: None,
+            models: vec![],
+            default_model: None,
+        }),
+    };
+    cradle_core::spawn(AgentSetup {
+        backend: Backend::new(&spec, None).unwrap(),
+        guard: PathGuard::new(root).unwrap(),
+        project: None,
+        modes: ModeSet::resolve(None, None, ClashChoice::Override).unwrap(),
+        mode: "plan".into(),
+        review: ReviewPolicy::User,
+        transcript: session::read(path).unwrap(),
+        session: Some(SessionLog::open(path.to_path_buf()).unwrap()),
+        data_dir: None,
+        trust_store: None,
+        global_modes: None,
+        soul: Soul::default(),
+    })
+}
+
+/// Run one turn. Returns its notices and errors.
+async fn turn_notices(handle: &mut AgentHandle, prompt: &str) -> (Vec<String>, Vec<String>) {
+    handle
+        .commands
+        .send(AgentCommand::Send(prompt.into()))
+        .unwrap();
+    let (mut notices, mut errors) = (Vec::new(), Vec::new());
+    while let Some(event) = handle.events.recv().await {
+        match event {
+            AgentEvent::Notice(n) => notices.push(n),
+            AgentEvent::Error(e) => errors.push(e),
+            AgentEvent::TurnFinished => return (notices, errors),
+            _ => {}
+        }
+    }
+    panic!("agent stopped");
+}
+
+#[tokio::test]
+async fn a_resumed_conversation_continues_its_cli_session() {
+    let (root, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let path = saved_transcript(root.path(), Some(("fake-claude", "s1")));
+    let mut agent = start_cli(root.path(), bin.path(), &path);
+
+    let (_, errors) = turn_notices(&mut agent, "next").await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let calls = cli_calls(bin.path());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "s1", "the saved session is resumed");
+    assert!(calls[0].1.ends_with("next"), "{}", calls[0].1);
+    assert!(
+        !calls[0].1.contains("previous_conversation"),
+        "the CLI already has the conversation"
+    );
+
+    let saved = cradle_core::session::read(&path).unwrap();
+    let texts: Vec<String> = saved
+        .messages
+        .iter()
+        .filter(|m| m.role != cradle_backends::Role::System)
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(texts, ["earlier question", "earlier answer", "next", "ok"]);
+    assert_eq!(saved.cli_session.unwrap().id, "s1");
+    let lines = fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        lines.matches("\"meta\":").count(),
+        2,
+        "same backend and session: nothing new recorded\n{lines}"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_cli_session_is_replaced_with_the_full_conversation() {
+    let (root, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let path = saved_transcript(root.path(), Some(("fake-claude", "gone")));
+    let mut agent = start_cli(root.path(), bin.path(), &path);
+
+    let (notices, errors) = turn_notices(&mut agent, "next").await;
+    assert!(errors.is_empty(), "the retry worked: {errors:?}");
+    assert!(
+        notices.iter().any(|n| n.contains("could not resume")),
+        "{notices:?}"
+    );
+    let calls = cli_calls(bin.path());
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, "gone");
+    assert_eq!(calls[1].0, "", "the retry starts a new session");
+    let retry = &calls[1].1;
+    assert!(retry.starts_with("<previous_conversation>"), "{retry}");
+    assert!(
+        retry.contains("<user>\nearlier question\n</user>")
+            && retry.contains("<assistant>\nearlier answer\n</assistant>"),
+        "{retry}"
+    );
+    assert!(
+        !retry.contains("<user>\nnext"),
+        "the new message is not repeated in the earlier conversation"
+    );
+    assert!(retry.ends_with("next"), "{retry}");
+
+    let saved = cradle_core::session::read(&path).unwrap();
+    assert_eq!(
+        saved.cli_session.unwrap().id,
+        "new-1",
+        "the new session is saved"
+    );
+}
+
+#[tokio::test]
+async fn another_providers_session_is_not_resumed() {
+    let (root, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let path = saved_transcript(root.path(), Some(("codex", "t1")));
+    let mut agent = start_cli(root.path(), bin.path(), &path);
+
+    let (notices, _) = turn_notices(&mut agent, "next").await;
+    assert!(
+        notices.iter().any(|n| n.contains("no earlier session")),
+        "{notices:?}"
+    );
+    turn_notices(&mut agent, "again").await;
+    let calls = cli_calls(bin.path());
+    assert_eq!(calls[0].0, "");
+    assert!(calls[0].1.contains("earlier question"), "{}", calls[0].1);
+    assert_eq!(calls[1].0, "new-1", "later turns resume the new session");
+    assert!(!calls[1].1.contains("previous_conversation"));
+
+    let saved = cradle_core::session::read(&path).unwrap();
+    let cli = saved.cli_session.unwrap();
+    assert_eq!(
+        (cli.provider.as_str(), cli.id.as_str()),
+        ("fake-claude", "new-1")
+    );
+}
+
+#[tokio::test]
+async fn loading_a_session_asks_to_switch_to_its_backend() {
+    use cradle_core::session::{Meta, SavedBackend, SessionLog};
+
+    let (root, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let path = saved_transcript(root.path(), None);
+    let mut agent = start_cli(root.path(), bin.path(), &path);
+
+    let other = root.path().join("other.jsonl");
+    let mut log = SessionLog::open(other.clone()).unwrap();
+    let saved = SavedBackend {
+        provider: "anthropic".into(),
+        model: "some-model".into(),
+    };
+    log.append_meta(&Meta::Backend(saved.clone())).unwrap();
+    log.append(&cradle_backends::Message::user("hi")).unwrap();
+
+    agent
+        .commands
+        .send(AgentCommand::LoadSession(other))
+        .unwrap();
+    let mut loaded = false;
+    while let Some(event) = agent.events.recv().await {
+        match event {
+            AgentEvent::SessionLoaded(history) => {
+                assert_eq!(history.len(), 1);
+                loaded = true;
+            }
+            AgentEvent::SessionBackend(asked) => {
+                assert!(loaded, "after the conversation is shown");
+                assert_eq!(asked, saved);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!("agent stopped");
 }

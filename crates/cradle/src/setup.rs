@@ -7,13 +7,14 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use cradle_backends::{Backend, Message};
+use cradle_backends::Backend;
 use cradle_config::soul::Soul;
 use cradle_config::user::UserConfig;
 use cradle_config::{Detection, ModeAccess, ProjectConfig, SourceKind, paths};
+use cradle_core::session::{SavedBackend, Transcript};
 use cradle_core::trust::{self, TrustStore};
 use cradle_core::{AgentSetup, ClashChoice, ModeSet, ReviewPolicy, session};
-use cradle_provider_spec::ProviderSpec;
+use cradle_provider_spec::{Backend as SpecBackend, ProviderSpec};
 use cradle_tools::PathGuard;
 
 use crate::{Error, RunArgs, inspect};
@@ -36,6 +37,8 @@ pub struct Session {
     pub soul_path: Option<PathBuf>,
     /// The user has no `soul.toml` yet.
     pub soul_missing: bool,
+    /// Shown when the TUI starts (e.g. why a resumed conversation's backend isn't used).
+    pub notices: Vec<String>,
 }
 
 /// Everything the agent needs except the backend.
@@ -45,7 +48,7 @@ pub struct AgentParts {
     pub modes: ModeSet,
     pub mode: String,
     pub review: ReviewPolicy,
-    pub history: Vec<Message>,
+    pub transcript: Transcript,
     pub session: Option<session::SessionLog>,
     pub data_dir: Option<PathBuf>,
     pub trust_store: Option<PathBuf>,
@@ -62,7 +65,7 @@ impl AgentParts {
             modes: self.modes,
             mode: self.mode,
             review: self.review,
-            history: self.history,
+            transcript: self.transcript,
             session: self.session,
             data_dir: self.data_dir,
             trust_store: self.trust_store,
@@ -96,7 +99,16 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
         })?,
         None => UserConfig::default(),
     };
-    let (backend, preselect) = choose_backend(args, &providers, &user);
+    let data_dir = paths::data_dir();
+    let (transcript, log) = open_transcript(args, data_dir.as_deref(), &root)?;
+    let mut notices = Vec::new();
+    let (backend, preselect) = choose_backend(
+        args,
+        &providers,
+        &user,
+        transcript.backend.as_ref(),
+        &mut notices,
+    );
 
     let soul_path = paths::soul();
     let soul = match &soul_path {
@@ -138,27 +150,14 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
         )));
     }
 
-    let data_dir = paths::data_dir();
-    let (history, log) = match &data_dir {
-        Some(dir) if args.resume => match session::latest(dir, &root) {
-            Ok(Some((path, messages))) => (messages, session::SessionLog::open(path).ok()),
-            Ok(None) => {
-                println!("No earlier conversation in this project; starting a new one.");
-                (Vec::new(), session::SessionLog::create(dir, &root).ok())
-            }
-            Err(e) => return Err(Error::Setup(format!("cannot resume: {e}"))),
-        },
-        Some(dir) => (Vec::new(), session::SessionLog::create(dir, &root).ok()),
-        None => (Vec::new(), None),
-    };
-
     let guard = PathGuard::new(&root).map_err(|source| Error::Io {
         path: root.clone(),
         source,
     })?;
     let mode_names = modes.names().map(str::to_owned).collect();
     Ok(Session {
-        resumed: history.len(),
+        resumed: transcript.messages.len(),
+        notices,
         root,
         mode_names,
         trusted,
@@ -174,7 +173,7 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
             modes,
             mode: args.mode.clone(),
             review: args.review.into(),
-            history,
+            transcript,
             session: log,
             data_dir,
             trust_store: config_dir.as_ref().map(|d| d.join("trust.toml")),
@@ -184,13 +183,87 @@ pub fn prepare(args: &RunArgs) -> Result<Session, Error> {
     })
 }
 
-/// Use `--provider`, else the saved default. Returns the backend, or why setup is needed,
-/// and which provider to highlight on the setup screen.
+/// The transcript to continue (`--continue`, `--resume <id>`) or a new one, and its log.
+/// Without a data directory nothing is saved.
+fn open_transcript(
+    args: &RunArgs,
+    data_dir: Option<&Path>,
+    root: &Path,
+) -> Result<(Transcript, Option<session::SessionLog>), Error> {
+    let Some(dir) = data_dir else {
+        return Ok((Transcript::default(), None));
+    };
+    let path = if let Some(id) = &args.resume_id {
+        Some(
+            session::find(dir, root, id)
+                .map_err(|e| Error::Setup(format!("cannot resume: {e}")))?,
+        )
+    } else if args.resume {
+        let latest =
+            session::latest(dir, root).map_err(|e| Error::Setup(format!("cannot resume: {e}")))?;
+        if latest.is_none() {
+            println!("No earlier conversation in this project; starting a new one.");
+        }
+        latest.map(|(path, _)| path)
+    } else {
+        None
+    };
+    match path {
+        Some(path) => {
+            let transcript =
+                session::read(&path).map_err(|e| Error::Setup(format!("cannot resume: {e}")))?;
+            Ok((transcript, session::SessionLog::open(path).ok()))
+        }
+        None => Ok((
+            Transcript::default(),
+            session::SessionLog::create(dir, root).ok(),
+        )),
+    }
+}
+
+/// The model to ask `spec` for, given a recorded or chosen model name. A CLI's `default`
+/// means its own default model.
+pub fn model_for(spec: &ProviderSpec, model: &str) -> Option<String> {
+    let is_cli = matches!(spec.backend, SpecBackend::Cli(_));
+    (!(is_cli && model == "default")).then(|| model.to_owned())
+}
+
+/// Use `--provider`, else the resumed conversation's backend, else the saved default.
+/// Returns the backend, or why setup is needed, and which provider to highlight on the
+/// setup screen. Why a resumed conversation's backend can't be used goes to `notices`.
 fn choose_backend(
     args: &RunArgs,
     providers: &[ProviderSpec],
     user: &UserConfig,
+    resumed: Option<&SavedBackend>,
+    notices: &mut Vec<String>,
 ) -> (Result<Backend, String>, Option<String>) {
+    if args.provider.is_none()
+        && !args.setup
+        && let Some(resumed) = resumed
+    {
+        let label = format!("{}/{}", resumed.provider, resumed.model);
+        match providers.iter().find(|p| p.id == resumed.provider) {
+            Some(spec) => {
+                let model = args
+                    .model
+                    .clone()
+                    .or_else(|| model_for(spec, &resumed.model));
+                match Backend::new(spec, model.as_deref()) {
+                    Ok(backend) => return (Ok(backend), Some(spec.id.clone())),
+                    Err(e) => notices.push(format!(
+                        "This conversation used {label}, which can't be used now ({e}). \
+                         Continuing with your default."
+                    )),
+                }
+            }
+            None => notices.push(format!(
+                "This conversation used {label}, but provider `{}` no longer exists. \
+                 Continuing with your default.",
+                resumed.provider
+            )),
+        }
+    }
     let saved = &user.default;
     let Some(id) = args.provider.clone().or_else(|| saved.provider.clone()) else {
         return (Err(String::new()), None);
@@ -380,5 +453,117 @@ fn ask(prompt: &str, allowed: &[&str]) -> Result<String, Error> {
         if allowed.contains(&answer.as_str()) {
             return Ok(answer);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cradle_provider_spec::{Auth, Capabilities, HttpApi, HttpProvider};
+
+    use super::*;
+    use crate::ReviewArg;
+
+    fn spec(id: &str) -> ProviderSpec {
+        ProviderSpec {
+            id: id.into(),
+            backend: SpecBackend::Http(HttpProvider {
+                api: HttpApi::OpenaiCompatible,
+                base_url: "http://127.0.0.1:9".into(),
+                auth: Auth::None,
+                models: vec!["small".into(), "large".into()],
+                default_model: None,
+                headers: vec![],
+                capabilities: Capabilities {
+                    tools: true,
+                    streaming: false,
+                    prompt_caching: false,
+                    reasoning: false,
+                },
+            }),
+        }
+    }
+
+    fn args(provider: Option<&str>, model: Option<&str>) -> RunArgs {
+        RunArgs {
+            root: ".".into(),
+            provider: provider.map(str::to_owned),
+            model: model.map(str::to_owned),
+            mode: "plan".into(),
+            review: ReviewArg::User,
+            setup: false,
+            resume: true,
+            resume_id: None,
+        }
+    }
+
+    fn chosen(
+        args: &RunArgs,
+        resumed: Option<&SavedBackend>,
+        notices: &mut Vec<String>,
+    ) -> (String, String) {
+        let providers = [spec("a"), spec("b")];
+        let mut user = UserConfig::default();
+        user.default.provider = Some("a".into());
+        user.default.model = Some("small".into());
+        let backend = choose_backend(args, &providers, &user, resumed, notices)
+            .0
+            .unwrap();
+        (backend.provider().to_owned(), backend.model().to_owned())
+    }
+
+    #[test]
+    fn a_resumed_conversation_keeps_its_backend() {
+        let resumed = SavedBackend {
+            provider: "b".into(),
+            model: "large".into(),
+        };
+        let mut notices = Vec::new();
+        assert_eq!(
+            chosen(&args(None, None), Some(&resumed), &mut notices),
+            ("b".into(), "large".into()),
+            "provider and model come from the transcript"
+        );
+        assert_eq!(
+            chosen(&args(None, Some("small")), Some(&resumed), &mut notices),
+            ("b".into(), "small".into()),
+            "--model still wins"
+        );
+        assert_eq!(
+            chosen(&args(Some("a"), None), Some(&resumed), &mut notices),
+            ("a".into(), "small".into()),
+            "--provider still wins"
+        );
+        assert_eq!(
+            chosen(&args(None, None), None, &mut notices),
+            ("a".into(), "small".into()),
+            "nothing recorded: the saved default"
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn a_missing_provider_falls_back_to_the_default_with_a_notice() {
+        let resumed = SavedBackend {
+            provider: "gone".into(),
+            model: "x".into(),
+        };
+        let mut notices = Vec::new();
+        assert_eq!(
+            chosen(&args(None, None), Some(&resumed), &mut notices),
+            ("a".into(), "small".into())
+        );
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("gone/x"), "{notices:?}");
+    }
+
+    #[test]
+    fn default_means_a_clis_own_model() {
+        assert_eq!(model_for(&spec("a"), "default"), Some("default".into()));
+        let cli = cradle_backends::builtin_providers()
+            .into_iter()
+            .find(|p| matches!(p.backend, SpecBackend::Cli(_)))
+            .expect("a CLI provider is compiled in");
+        assert_eq!(model_for(&cli, "default"), None);
+        assert_eq!(model_for(&cli, "opus"), Some("opus".into()));
     }
 }

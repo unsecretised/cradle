@@ -43,6 +43,9 @@ pub struct RunArgs {
     /// Continue the most recent conversation in this project.
     #[arg(long = "continue", short = 'c')]
     resume: bool,
+    /// Continue a specific conversation: its id from /session, or a unique prefix of it.
+    #[arg(long = "resume", value_name = "ID", conflicts_with = "resume")]
+    resume_id: Option<String>,
 }
 
 #[derive(Subcommand)]

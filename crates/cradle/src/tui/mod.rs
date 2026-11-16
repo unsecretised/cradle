@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use cradle_backends::{BackendError, Block, Message, Role, Usage};
-use cradle_core::session::SessionInfo;
+use cradle_core::session::{SavedBackend, SessionInfo};
 use cradle_core::{
     AgentCommand, AgentEvent, AgentHandle, Approval, FileStat, ReviewPolicy, Verdict,
 };
@@ -89,6 +89,7 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         user_config,
         soul_path,
         soul_missing,
+        notices,
     } = session;
     let mut keys = EventStream::new();
     let theme_path = cradle_config::paths::theme();
@@ -128,6 +129,7 @@ async fn start(terminal: &mut ratatui::DefaultTerminal, session: Session) -> Res
         theme_warnings,
         theme_path,
         soul_path,
+        notices,
     };
     let mut app = App::new(info, &setup);
     if onboarded {
@@ -156,6 +158,8 @@ struct StartInfo<'a> {
     theme_path: Option<PathBuf>,
     /// `~/.config/cradle/soul.toml`, where `/preferences` saves.
     soul_path: Option<PathBuf>,
+    /// From setup, shown after the resumed conversation.
+    notices: Vec<String>,
 }
 
 /// Results of work the UI started in the background.
@@ -193,6 +197,7 @@ async fn event_loop(
                     while let Ok(event) = handle.events.try_recv() {
                         app.on_agent(event);
                     }
+                    app.restore_backend(handle);
                 }
                 None => return Err(Error::Setup("the agent stopped unexpectedly".into())),
             },
@@ -301,6 +306,8 @@ pub(crate) struct App {
     /// The user's own preferences, as last saved.
     soul: Soul,
     soul_path: Option<PathBuf>,
+    /// A loaded conversation's backend, to switch to (see [`App::restore_backend`]).
+    restore: Option<SavedBackend>,
 }
 
 impl App {
@@ -333,12 +340,13 @@ impl App {
             ));
         }
         if info.resumed > 0 {
-            items.extend(history_items(&setup.history));
+            items.extend(history_items(&setup.transcript.messages));
             items.push(Item::Notice(format!(
                 "Resumed a conversation with {} messages.",
                 info.resumed
             )));
         }
+        items.extend(info.notices.into_iter().map(Item::Notice));
         items.extend(theme_notices(&info.theme_warnings));
         App {
             items,
@@ -383,6 +391,7 @@ impl App {
             theme_path: info.theme_path,
             soul: setup.soul,
             soul_path: info.soul_path,
+            restore: None,
         }
     }
 
@@ -465,6 +474,7 @@ impl App {
                 )));
                 self.scroll = 0;
             }
+            AgentEvent::SessionBackend(saved) => self.restore = Some(saved),
             AgentEvent::Notice(n) => self.items.push(Item::Notice(n)),
             AgentEvent::Error(e) => self.items.push(Item::Error(e)),
             AgentEvent::TurnFinished => {
@@ -1089,8 +1099,7 @@ impl App {
             self.note("The current provider is not in the provider list.");
             return;
         };
-        let is_cli = matches!(spec.backend, SpecBackend::Cli(_));
-        let model = (!(is_cli && model == "default")).then(|| model.to_owned());
+        let model = crate::setup::model_for(&spec, model);
         match Backend::new(&spec, model.as_deref()) {
             Ok(backend) => {
                 send(handle, AgentCommand::SetBackend(Box::new(backend)));
@@ -1103,6 +1112,32 @@ impl App {
                 }
             }
             Err(e) => self.items.push(Item::Error(e.to_string())),
+        }
+    }
+
+    /// Switch to the backend a loaded conversation used, if any is pending. Unlike
+    /// [`App::switch_model`], this does not change the saved default.
+    fn restore_backend(&mut self, handle: &AgentHandle) {
+        let Some(saved) = self.restore.take() else {
+            return;
+        };
+        let label = format!("{}/{}", saved.provider, saved.model);
+        let current = format!("{}/{}", self.provider, self.model);
+        let Some(spec) = self.providers.iter().find(|p| p.id == saved.provider) else {
+            self.note(&format!(
+                "This conversation used {label}, but provider `{}` no longer exists. \
+                 Continuing with {current}.",
+                saved.provider
+            ));
+            return;
+        };
+        let model = crate::setup::model_for(spec, &saved.model);
+        match Backend::new(spec, model.as_deref()) {
+            Ok(backend) => send(handle, AgentCommand::SetBackend(Box::new(backend))),
+            Err(e) => self.note(&format!(
+                "This conversation used {label}, which can't be used now ({e}). Continuing \
+                 with {current}."
+            )),
         }
     }
 
@@ -1261,7 +1296,7 @@ mod tests {
             modes: ModeSet::resolve(None, None, cradle_core::ClashChoice::Override).unwrap(),
             mode: "plan".into(),
             review: ReviewPolicy::User,
-            history: vec![],
+            transcript: Default::default(),
             session: None,
             data_dir: None,
             trust_store: None,
@@ -1279,6 +1314,7 @@ mod tests {
             theme_warnings: Vec::new(),
             theme_path,
             soul_path: Some(dir.join("soul.toml")),
+            notices: Vec::new(),
         };
         let app = App::new(info, &setup);
         (app, cradle_core::spawn(setup))
@@ -1335,6 +1371,34 @@ mod tests {
             ratatui::style::Style::new().fg(ratatui::style::Color::Blue)
         );
         assert!(screen(&app).contains("Theme reloaded"));
+    }
+
+    #[tokio::test]
+    async fn a_loaded_conversation_switches_back_to_its_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, mut handle) = start(dir.path());
+        app.on_agent(AgentEvent::SessionBackend(SavedBackend {
+            provider: "local".into(),
+            model: "large".into(),
+        }));
+        app.restore_backend(&handle);
+        until(&mut app, &mut handle, |app| app.model == "large").await;
+        assert_eq!(app.provider, "local");
+        assert!(app.restore.is_none());
+
+        app.on_agent(AgentEvent::SessionBackend(SavedBackend {
+            provider: "gone".into(),
+            model: "x".into(),
+        }));
+        app.restore_backend(&handle);
+        assert!(
+            app.items.iter().any(|i| matches!(
+                i,
+                Item::Notice(n) if n.contains("provider `gone` no longer exists")
+            )),
+            "the user is told why"
+        );
+        assert_eq!(app.model, "large", "the current backend stays");
     }
 
     fn screen(app: &App) -> String {

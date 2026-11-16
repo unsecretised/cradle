@@ -15,7 +15,7 @@ Implemented features, with details in `features/`.
 | [PROVIDERS_TOML](features/FEATURE_PROVIDERS_TOML.md) | Compile-time `providers.toml` + runtime overlay merged by `id` |
 | [API_BACKENDS](features/FEATURE_API_BACKENDS.md) | Anthropic + OpenAI-compatible adapters; env var or keychain keys |
 | [CLI_BACKENDS](features/FEATURE_CLI_BACKENDS.md) | Claude Code + Codex with built-in tools off, Cradle's tools over a local MCP server |
-| [SESSIONS](features/FEATURE_SESSIONS.md) | JSONL transcripts, `--continue`, `/session` |
+| [SESSIONS](features/FEATURE_SESSIONS.md) | JSONL transcripts, `--continue`, `--resume <id>`, `/session`; backend and CLI session restored, full-conversation fallback |
 | [TUI](features/FEATURE_TUI.md) | ratatui interface: setup screen, approvals, diffs, sidebar, slash commands |
 | [THEME](features/FEATURE_THEME.md) | Global `theme.toml`: dark/light presets, palette, roles, per-element styles, `/theme reload` |
 | [SOUL](features/FEATURE_SOUL.md) | Preferences (`soul.toml`, `/preferences`): questions 1-10, audience, detail, `auto_verify`; project values only when the user picks them |
@@ -28,6 +28,5 @@ Implemented features, with details in `features/`.
 | [SANDBOX](roadmap/FEATURE_SANDBOX.md) | Sandbox for `[commands]` |
 | [ACP_AGENT](roadmap/FEATURE_ACP_AGENT.md) | Later: run Cradle inside ACP editors |
 | [GLOBAL_MODES](roadmap/FEATURE_GLOBAL_MODES.md) | User-level custom modes in `~/.config/cradle/modes/`; out of the Tab cycle unless `cycle: true` |
-| [SESSION_RESUME](roadmap/FEATURE_SESSION_RESUME.md) | Record provider/model and CLI session ids so resumed sessions keep their context |
 | [MORE_PROVIDERS](roadmap/FEATURE_MORE_PROVIDERS.md) | Grok, OpenCode Go, Amp, Pi, Antigravity and a ranked list of other APIs and CLIs |
 | [TOOL_VARIABLES](roadmap/FEATURE_TOOL_VARIABLES.md) | `save_as` on any tool, `var_*` filter tools, `{"$var": ...}` references in later calls |

@@ -43,7 +43,8 @@ still goes through Cradle's mode checks, path guard and approvals.
 - `<binary> --version` is checked against the provider's `version` range. If the CLI is
   missing or outside the range, that provider can't be used and the setup screen explains
   why. This is stricter than the original "warn and continue".
-- The CLI's session id is kept in memory for the current Cradle run only.
+- The CLI's session id is saved in the transcript and resumed across runs (see
+  `FEATURE_SESSIONS.md`).
 - One-off requests without tools (the reviewer) run in a fresh, unsaved CLI session
   (`--no-session-persistence` / `--ephemeral`).
 - Fixture-based parser tests cover each CLI's output format.

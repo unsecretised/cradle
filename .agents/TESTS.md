@@ -26,15 +26,18 @@ access, API keys or an installed CLI.
 - **cradle-core**: trust snapshot hash stability, diff and store round trip (project
   preferences in the snapshot, stored preference choices); preference resolution; mode
   resolution and clashes; reviewer verdict parsing (missing or garbled means unsure);
-  prompt assembly (including each preference band); session log write, list and resume;
-  `ask_user` answer formatting.
+  prompt assembly (including each preference band); session log write, list and resume,
+  meta lines (round trip, last wins, old transcripts), lookup by id or prefix; the
+  `<previous_conversation>` fallback text; `ask_user` answer formatting.
 - **cradle** (bin): theme presets (complete and valid, the dark preset matches the
   original colours and is the `--example` output, roles cascade, palette names resolve,
   bad values keep the preset, optional background); slash command suggestions, model
   picker, markdown rendering, text wrapping, tool cards, and TUI behaviour driven by key
   events (Tab/Shift+Tab mode cycling, input history, sidebar, approvals with requested
   changes, grouped tool calls, multi-question stepping and dismissal, `/theme reload`,
-  `/preferences` stepping and saving); preference answers and typed answers.
+  `/preferences` stepping and saving, switching back to a loaded conversation's
+  backend); preference answers and typed answers; startup backend precedence
+  (flag > transcript > saved default).
 
 ## Integration tests
 
@@ -56,6 +59,9 @@ rules whatever the model asks for:
 - preferences are announced once and again after a change; project preferences apply
   only when picked and the choice is remembered; `auto_verify` runs build/test once after
   edits, and reports a failed build to the model
+- CLI session resume, against a fake `claude` shell script (no real CLI): the saved
+  session is resumed; an expired one is retried with the full conversation; another
+  provider's session is not reused; loading a session asks to switch to its backend
 
 ## Rules for new tests
 
